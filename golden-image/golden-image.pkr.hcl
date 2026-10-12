@@ -28,6 +28,6 @@ build {
   sources = ["source.qemu.ubuntu_k8s"]
   provisioner "shell" {
     execute_command = "sudo sh -c '{{ .Vars }} {{ .Path }}'"
-    script          = "./dependencies.sh"
+    script          = "./dependecies.sh"
   }
 }
