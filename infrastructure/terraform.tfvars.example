@@ -1,0 +1,4 @@
+arvan_api_key = "ARVANCLOUD_API_KEY"
+region        = "ir-thr-c2"
+ssh_key_name  = "SSH_KEY_NAME"
+image_id      = "PRIVATE_IMAGE_ID"
