@@ -12,3 +12,5 @@ crash.*.log
 *.tfvars.json
 .terraformrc
 terraform.rc
+*.pem
+*.key
