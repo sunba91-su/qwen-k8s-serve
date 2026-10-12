@@ -15,6 +15,8 @@ source "qemu" "ubuntu_k8s" {
   disk_size         = "20G"
   disk_interface    = "virtio"
   net_device        = "virtio-net"
+  disk_image        = true
+  use_backing_file  = false
   communicator      = "ssh"
   ssh_username      = "ubuntu"
   ssh_password      = "5a619bc4-073d-46f9-a23b-99f0d9446458"
