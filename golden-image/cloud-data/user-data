@@ -1,0 +1,5 @@
+password: 5a619bc4-073d-46f9-a23b-99f0d9446458
+chpasswd: {
+    expire: False
+}
+ssh_pwauth: True
