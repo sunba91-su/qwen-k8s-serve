@@ -2,3 +2,14 @@
 *.build
 *.log
 golden-image/output-image
+infrastructure/variables.tf
+
+**/.terraform/*
+*.tfstate
+*.tfstate.*
+crash.log
+crash.*.log
+*.tfvars
+*.tfvars.json
+.terraformrc
+terraform.rc
