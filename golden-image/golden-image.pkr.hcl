@@ -24,6 +24,9 @@ source "qemu" "ubuntu_k8s" {
   headless          = true
   cd_files          = ["./cloud-data/user-data", "./cloud-data/meta-data"]
   cd_label          = "cidata"
+  qemuargs = [
+    ["-smbios", "type=1,serial=ds=nocloud"]
+  ]
 }
 
 build {
