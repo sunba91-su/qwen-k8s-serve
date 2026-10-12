@@ -2,7 +2,6 @@
 *.build
 *.log
 golden-image/output-image
-infrastructure/variables.tf
 
 **/.terraform/*
 *.tfstate
