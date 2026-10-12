@@ -14,3 +14,4 @@ crash.*.log
 terraform.rc
 *.pem
 *.key
+.terraform.lock.hcl
