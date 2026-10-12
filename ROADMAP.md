@@ -26,7 +26,7 @@ so progress is verifiable rather than estimated.
 
 - [ ] Define the repository layout:
   ```
-  terraform/        # VM, network, firewall, SSH key provisioning
+  infrastructure/        # VM, network, firewall, SSH key provisioning
   ansible/          # OS hardening, container runtime, kubeadm bootstrap
   k8s/              # Kubernetes manifests & Helm values (kustomize overlays)
   serve/            # Ray Serve application (vLLM engine + FastAPI ingress)
@@ -37,11 +37,11 @@ so progress is verifiable rather than estimated.
   .github/workflows # CI/CD pipelines
   docs/             # Architecture, runbooks, access guide
   ```
-- [ ] 🔴 Add `.gitignore` entries for `*.tfstate*`, `.terraform/`, `kubeconfig*`, `*.pem`, `.venv/`
+- [x] 🔴 Add `.gitignore` entries for `*.tfstate*`, `.terraform/`, `kubeconfig*`, `*.pem`, `.venv/`
 - [ ] 🟡 Add `pre-commit` hooks: `terraform fmt`, `tflint`, `ansible-lint`, `yamllint`, `ruff`, `kubeconform`
 - [ ] 🟡 Add a top-level `Makefile` as the single entry point (`make infra`, `make cluster`, `make deploy`, `make loadtest`, `make destroy`)
 - [ ] 🔴 Start `ai-usage.md` immediately and update it continuously (do not reconstruct it at the end)
-- [ ] Choose and document sizing for the 3 nodes (e.g. 1× control-plane 4 vCPU/8 GiB, 2× workers 8 vCPU/16 GiB)
+- [x] Choose and document sizing for the 3 nodes (e.g. 1× control-plane 4 vCPU/8 GiB, 2× workers 8 vCPU/16 GiB)
 
 **Exit criterion:** repository skeleton committed, tooling versions pinned in `docs/versions.md`.
 
@@ -49,15 +49,15 @@ so progress is verifiable rather than estimated.
 
 ## Phase 1 — Infrastructure Provisioning with IaC (Day 1)
 
-- [ ] 🔴 Configure the Terraform provider for the target cloud (ArvanCloud IaaS, or an equivalent provider) with credentials supplied via environment variables only
-- [ ] 🔴 Configure a remote/locked Terraform state backend (S3-compatible object storage) or document why local state is acceptable
-- [ ] 🔴 Provision 3 virtual machines via a reusable `modules/node` module
-  - [ ] `k8s-cp-01` — control plane
-  - [ ] `k8s-worker-01` — Ray head + platform services (monitoring, ingress)
-  - [ ] `k8s-worker-02` — Ray worker dedicated to vLLM inference
-- [ ] 🔴 Provision private network, security groups/firewall rules (22, 6443, 80/443, NodePort range restricted, intra-cluster traffic)
-- [ ] 🔴 Inject SSH public key; disable password authentication
-- [ ] 🔴 Output node IPs and auto-generate the Ansible inventory (`templatefile` → `ansible/inventory/hosts.ini`)
+- [x] 🔴 Configure the Terraform provider for the target cloud (ArvanCloud IaaS, or an equivalent provider) with credentials supplied via environment variables only
+- [x] 🔴 Configure a remote/locked Terraform state backend (S3-compatible object storage) or document why local state is acceptable
+- [x] 🔴 Provision 3 virtual machines via a reusable `modules/node` module
+  - [x] `k8s-cp-01` — control plane
+  - [x] `k8s-worker-01` — Ray head + platform services (monitoring, ingress)
+  - [x] `k8s-worker-02` — Ray worker dedicated to vLLM inference
+- [x] 🔴 Provision private network, security groups/firewall rules (22, 6443, 80/443, NodePort range restricted, intra-cluster traffic)
+- [x] 🔴 Inject SSH public key; disable password authentication
+- [x] 🔴 Output node IPs and auto-generate the Ansible inventory (`templatefile` → `ansible/inventory/hosts.ini`)
 - [ ] 🟡 Tag/label all resources (`project=qwen-k8s-serve`, `owner`, `env`)
 - [ ] 🟡 Validate idempotency: `terraform plan` after `apply` shows no changes
 
