@@ -1,0 +1,119 @@
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: vllm-serve-code
+  namespace: default
+data:
+  serve_script.py: |
+    from fastapi import FastAPI
+    from ray import serve
+    from pydantic import BaseModel
+    from vllm.engine.arg_utils import AsyncEngineArgs
+    from vllm.engine.async_llm_engine import AsyncLLMEngine
+    from vllm.sampling_params import SamplingParams
+    import uuid
+
+    app = FastAPI()
+
+    class GenerateRequest(BaseModel):
+        prompt: str
+        max_new_tokens: int = 64
+
+    @serve.deployment(num_replicas=1, ray_actor_options={"num_cpus": 2})
+    @serve.ingress(app)
+    class QwenVLLMDeployment:
+        def __init__(self):
+            engine_args = AsyncEngineArgs(
+                model="Qwen/Qwen2.5-0.5B-Instruct",
+                device="cpu",
+                dtype="float32",
+                gpu_memory_utilization=0.0,
+                enforce_eager=True,
+                max_model_len=1024
+            )
+            self.engine = AsyncLLMEngine.from_engine_args(engine_args)
+
+        @app.post("/generate")
+        async def generate(self, req: GenerateRequest):
+            request_id = str(uuid.uuid4())
+            sampling_params = SamplingParams(max_tokens=req.max_new_tokens)
+            
+            results_generator = self.engine.generate(req.prompt, sampling_params, request_id)
+            final_output = None
+            async for request_output in results_generator:
+                final_output = request_output
+            
+            return {"text": final_output.outputs[0].text}
+            
+    app_builder = QwenVLLMDeployment.bind()
+
+---
+# 2. RayService Manifest
+apiVersion: ray.io/v1
+kind: RayService
+metadata:
+  name: qwen-ai-service
+  namespace: default
+spec:
+  serveConfigV2: |
+    applications:
+      - name: qwen-app
+        import_path: serve_script:app_builder
+        route_prefix: /api
+        runtime_env:
+          pip:
+            - vllm
+            - ray[serve]
+            - fastapi
+  rayClusterConfig:
+    rayVersion: '2.10.0'
+    headGroupSpec:
+      rayStartParams:
+        dashboard-host: '0.0.0.0'
+      template:
+        spec:
+          volumes:
+            - name: code-volume
+              configMap:
+                name: vllm-serve-code
+          containers:
+            - name: ray-head
+              image: rayproject/ray:2.10.0-py310-cpu
+              volumeMounts:
+                - name: code-volume
+                  mountPath: /home/ray/serve_script.py
+                  subPath: serve_script.py
+              resources:
+                requests:
+                  cpu: "1"
+                  memory: "2Gi"
+                limits:
+                  cpu: "2"
+                  memory: "4Gi"
+    workerGroupSpecs:
+      - groupName: vllm-worker
+        replicas: 1
+        minReplicas: 1
+        maxReplicas: 1
+        rayStartParams: {}
+        template:
+          spec:
+            volumes:
+              - name: code-volume
+                configMap:
+                  name: vllm-serve-code
+            containers:
+              - name: ray-worker
+                image: rayproject/ray:2.10.0-py310-cpu
+                volumeMounts:
+                  - name: code-volume
+                    mountPath: /home/ray/serve_script.py
+                    subPath: serve_script.py
+                resources:
+                  requests:
+                    cpu: "2"
+                    memory: "4Gi"
+                  limits:
+                    cpu: "4"
+                    memory: "6Gi"
