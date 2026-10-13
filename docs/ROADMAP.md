@@ -68,16 +68,16 @@ so progress is verifiable rather than estimated.
 ## Phase 2 — Kubernetes Cluster Setup (Day 2)
 
 ### 2.1 Node preparation (Ansible role `common`)
-- [ ] 🔴 OS baseline: package updates, time sync (chrony), swap disabled, kernel modules (`overlay`, `br_netfilter`), sysctl tuning
-- [ ] 🔴 Install and configure `containerd` with `SystemdCgroup = true`
-- [ ] 🔴 Install pinned `kubeadm`, `kubelet`, `kubectl` versions and hold packages
+- [x] 🔴 OS baseline: package updates, time sync (chrony), swap disabled, kernel modules (`overlay`, `br_netfilter`), sysctl tuning
+- [x] 🔴 Install and configure `containerd` with `SystemdCgroup = true`
+- [x] 🔴 Install pinned `kubeadm`, `kubelet`, `kubectl` versions and hold packages
 - [ ] 🟡 Basic hardening: UFW/firewalld, fail2ban, unattended security updates
 
 ### 2.2 Cluster bootstrap (Ansible roles `control_plane`, `worker`)
-- [ ] 🔴 `kubeadm init` on the control plane with a versioned `ClusterConfiguration`
-- [ ] 🔴 Join both workers using a generated, short-lived join token
-- [ ] 🔴 Install CNI (Calico or Cilium) via Helm
-- [ ] 🔴 Fetch `admin.conf` to the operator workstation as `kubeconfig` (never committed)
+- [x] 🔴 `kubeadm init` on the control plane with a versioned `ClusterConfiguration`
+- [x] 🔴 Join both workers using a generated, short-lived join token
+- [x] 🔴 Install CNI (Calico or Cilium) via Helm
+- [x] 🔴 Fetch `admin.conf` to the operator workstation as `kubeconfig` (never committed)
 - [ ] 🟡 Enable kubelet `cpuManagerPolicy: static` and reserved CPUs on the inference node (prerequisite for Guaranteed-QoS pinning in Phase 7)
 
 ### 2.3 Cluster add-ons

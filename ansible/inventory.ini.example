@@ -9,3 +9,6 @@
 ansible_user=ubuntu
 ansible_ssh_private_key_file=/PATH/TO/SSH/KEY
 ansible_ssh_common_args='-o StrictHostKeyChecking=no'
+registry_username=REGISTRY_USERNAME
+registry_password=REGISTRY_PASSWORD
+registry_host="mirror.asiyabani.id.ir"
