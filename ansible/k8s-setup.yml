@@ -101,7 +101,6 @@
     - name: Initialize the cluster with kubeadm
       command: kubeadm init --pod-network-cidr=192.168.0.0/16 --image-repository=registry.aliyuncs.com/google_containers --ignore-preflight-errors=ImagePull
       args:
-      args:
         creates: /etc/kubernetes/admin.conf
 
     - name: Setup kubeconfig for ubuntu user
