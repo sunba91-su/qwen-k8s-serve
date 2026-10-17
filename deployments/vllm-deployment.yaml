@@ -1,55 +1,5 @@
 ---
-apiVersion: v1
-kind: ConfigMap
-metadata:
-  name: vllm-serve-code
-  namespace: default
-data:
-  serve_script.py: |
-    from fastapi import FastAPI
-    from ray import serve
-    from pydantic import BaseModel
-    from vllm.engine.arg_utils import AsyncEngineArgs
-    from vllm.engine.async_llm_engine import AsyncLLMEngine
-    from vllm.sampling_params import SamplingParams
-    import uuid
 
-    app = FastAPI()
-
-    class GenerateRequest(BaseModel):
-        prompt: str
-        max_new_tokens: int = 64
-
-    @serve.deployment(num_replicas=1, ray_actor_options={"num_cpus": 2})
-    @serve.ingress(app)
-    class QwenVLLMDeployment:
-        def __init__(self):
-            engine_args = AsyncEngineArgs(
-                model="Qwen/Qwen2.5-0.5B-Instruct",
-                device="cpu",
-                dtype="float32",
-                gpu_memory_utilization=0.0,
-                enforce_eager=True,
-                max_model_len=1024
-            )
-            self.engine = AsyncLLMEngine.from_engine_args(engine_args)
-
-        @app.post("/generate")
-        async def generate(self, req: GenerateRequest):
-            request_id = str(uuid.uuid4())
-            sampling_params = SamplingParams(max_tokens=req.max_new_tokens)
-            
-            results_generator = self.engine.generate(req.prompt, sampling_params, request_id)
-            final_output = None
-            async for request_output in results_generator:
-                final_output = request_output
-            
-            return {"text": final_output.outputs[0].text}
-            
-    app_builder = QwenVLLMDeployment.bind()
-
----
-# 2. RayService Manifest
 apiVersion: ray.io/v1
 kind: RayService
 metadata:
@@ -57,63 +7,130 @@ metadata:
   namespace: default
 spec:
   serveConfigV2: |
+    http_options:
+      host: 0.0.0.0
+      port: 8000
     applications:
       - name: qwen-app
-        import_path: serve_script:app_builder
-        route_prefix: /api
+        import_path: serve_script:deployment
+        route_prefix: /
         runtime_env:
-          pip:
-            - vllm
-            - ray[serve]
-            - fastapi
+          env_vars:
+            MODEL_ID: "Qwen/Qwen2.5-0.5B-Instruct"
+            SERVED_MODEL_NAME: "Qwen/Qwen2.5-0.5B-Instruct"
+            MODEL_DTYPE: "float32"
+            MAX_MODEL_LEN: "2048"
+            MAX_NUM_SEQS: "16"
+            KV_CACHE_GIB: "0.5"
+            VLLM_CPU_OMP_THREADS_BIND: "nobind"
+            OMP_NUM_THREADS: "3"
+        deployments:
+          - name: qwen-vllm
+            num_replicas: 1
+            max_concurrent_queries: 32
+            ray_actor_options:
+              num_cpus: 3
+  serveService:
+    metadata:
+      name: qwen-ai-service-serve
+    spec:
+      type: NodePort
+      ports:
+        - name: serve
+          port: 8000
+          targetPort: 8000
+          nodePort: 30800
   rayClusterConfig:
-    rayVersion: '2.10.0'
+    rayVersion: "2.9.3"
     headGroupSpec:
       rayStartParams:
-        dashboard-host: '0.0.0.0'
+        dashboard-host: "0.0.0.0"
+        num-cpus: "0"
+        object-store-memory: "268435456"
+        metrics-export-port: "8080"
       template:
         spec:
+          securityContext:
+            runAsUser: 1000
+            runAsNonRoot: true
           volumes:
-            - name: code-volume
-              configMap:
-                name: vllm-serve-code
+            - name: dshm
+              emptyDir:
+                medium: Memory
+                sizeLimit: 512Mi
           containers:
             - name: ray-head
-              image: rayproject/ray:2.10.0-py310-cpu
+              image: ghcr.io/sunba91-su/qwen-serve:v0.1.0
+              imagePullPolicy: IfNotPresent
+              ports:
+                - name: gcs
+                  containerPort: 6379
+                - name: dashboard
+                  containerPort: 8265
+                - name: client
+                  containerPort: 10001
+                - name: serve
+                  containerPort: 8000
+                - name: metrics
+                  containerPort: 8080
               volumeMounts:
-                - name: code-volume
-                  mountPath: /home/ray/serve_script.py
-                  subPath: serve_script.py
+                - name: dshm
+                  mountPath: /dev/shm
+              securityContext:
+                allowPrivilegeEscalation: false
+                capabilities:
+                  drop: ["ALL"]
               resources:
                 requests:
                   cpu: "1"
-                  memory: "2Gi"
+                  memory: 2Gi
                 limits:
                   cpu: "2"
-                  memory: "4Gi"
+                  memory: 3Gi
     workerGroupSpecs:
       - groupName: vllm-worker
         replicas: 1
         minReplicas: 1
         maxReplicas: 1
-        rayStartParams: {}
+        rayStartParams:
+          num-cpus: "3"
+          object-store-memory: "268435456"
+          metrics-export-port: "8080"
         template:
           spec:
+            securityContext:
+              runAsUser: 1000
+              runAsNonRoot: true
+            affinity:
+              podAntiAffinity:
+                requiredDuringSchedulingIgnoredDuringExecution:
+                  - topologyKey: kubernetes.io/hostname
+                    labelSelector:
+                      matchLabels:
+                        ray.io/node-type: head
             volumes:
-              - name: code-volume
-                configMap:
-                  name: vllm-serve-code
+              - name: dshm
+                emptyDir:
+                  medium: Memory
+                  sizeLimit: 512Mi
             containers:
               - name: ray-worker
-                image: rayproject/ray:2.10.0-py310-cpu
+                image: ghcr.io/sunba91-su/qwen-serve:v0.1.0
+                imagePullPolicy: IfNotPresent
+                ports:
+                  - name: metrics
+                    containerPort: 8080
                 volumeMounts:
-                  - name: code-volume
-                    mountPath: /home/ray/serve_script.py
-                    subPath: serve_script.py
+                  - name: dshm
+                    mountPath: /dev/shm
+                securityContext:
+                  allowPrivilegeEscalation: false
+                  capabilities:
+                    drop: ["ALL"]
                 resources:
                   requests:
-                    cpu: "2"
-                    memory: "4Gi"
+                    cpu: "3"
+                    memory: 7Gi
                   limits:
-                    cpu: "4"
-                    memory: "6Gi"
+                    cpu: "3"
+                    memory: 7Gi

@@ -8,7 +8,7 @@ Endpoints:
     GET  /healthz               Liveness
 
 RayService serveConfigV2 import_path: serve_script:deployment
-(mount the ConfigMap into head and worker pods and add the mount path to PYTHONPATH).
+(the module is baked into the image at /home/ray/app, which is on PYTHONPATH).
 """
 
 import asyncio
@@ -45,14 +45,19 @@ MAX_PROMPT_CHARS = int(os.getenv("MAX_PROMPT_CHARS", "8000"))
 
 MAX_MODEL_LEN = int(os.getenv("MAX_MODEL_LEN", "2048"))
 MAX_NUM_SEQS = int(os.getenv("MAX_NUM_SEQS", "16"))
-VLLM_DTYPE = os.getenv("VLLM_DTYPE", "float32")
-# Ignored by the CPU backend (KV cache size comes from VLLM_CPU_KVCACHE_SPACE, in GiB).
-# Some vLLM releases validate this as > 0; set the env var to e.g. 0.9 if 0.0 is rejected.
-VLLM_GPU_MEMORY_UTILIZATION = float(os.getenv("VLLM_GPU_MEMORY_UTILIZATION", "0.0"))
+# App settings avoid the VLLM_ prefix: vLLM warns on unknown VLLM_* environment variables.
+MODEL_DTYPE = os.getenv("MODEL_DTYPE", "float32")
+# Explicit KV cache size. 0.5 GiB holds ~20k float32 tokens for this model, enough for
+# MAX_NUM_SEQS short-prompt requests; size it explicitly so memory use is predictable.
+KV_CACHE_GIB = float(os.getenv("KV_CACHE_GIB", "0.5"))
+# Must be in (0, 1]; only used when no explicit KV cache size is set.
+GPU_MEMORY_UTILIZATION = float(os.getenv("GPU_MEMORY_UTILIZATION", "0.9"))
 
-# Ray exports OMP_NUM_THREADS=num_cpus to the replica, which drives vLLM's CPU threading.
-REPLICA_NUM_CPUS = float(os.getenv("REPLICA_NUM_CPUS", "6"))
-MAX_ONGOING_REQUESTS = int(os.getenv("MAX_ONGOING_REQUESTS", "32"))
+# Defaults only; the RayService serveConfigV2 overrides ray_actor_options and
+# max_concurrent_queries. OMP_NUM_THREADS should match num_cpus.
+REPLICA_NUM_CPUS = float(os.getenv("REPLICA_NUM_CPUS", "3"))
+# Ray 2.9 names this max_concurrent_queries; max_ongoing_requests arrived in 2.10.
+MAX_CONCURRENT_QUERIES = int(os.getenv("MAX_CONCURRENT_QUERIES", "32"))
 
 # Qwen2.5 recommended sampling defaults for the /generate endpoint.
 GENERATE_TEMPERATURE = float(os.getenv("GENERATE_TEMPERATURE", "0.7"))
@@ -66,9 +71,10 @@ def build_engine_args() -> AsyncEngineArgs:
         "served_model_name": SERVED_MODEL_NAME,
         "download_dir": MODEL_CACHE_DIR,
         "device": "cpu",
-        "dtype": VLLM_DTYPE,
+        "dtype": MODEL_DTYPE,
         "enforce_eager": True,
-        "gpu_memory_utilization": VLLM_GPU_MEMORY_UTILIZATION,
+        "gpu_memory_utilization": GPU_MEMORY_UTILIZATION,
+        "kv_cache_memory_bytes": int(KV_CACHE_GIB * 2**30),
         "max_model_len": MAX_MODEL_LEN,
         "max_num_seqs": MAX_NUM_SEQS,
         "tensor_parallel_size": 1,
@@ -194,7 +200,7 @@ async def validation_error_handler(request: Request, exc: RequestValidationError
 @serve.deployment(
     name="qwen-vllm",
     num_replicas=1,
-    max_ongoing_requests=MAX_ONGOING_REQUESTS,
+    max_concurrent_queries=MAX_CONCURRENT_QUERIES,
     ray_actor_options={"num_cpus": REPLICA_NUM_CPUS},
     health_check_period_s=10,
     health_check_timeout_s=30,
@@ -202,7 +208,8 @@ async def validation_error_handler(request: Request, exc: RequestValidationError
 )
 @serve.ingress(app)
 class QwenVLLMDeployment:
-    def __init__(self) -> None:
+    # Ray Serve awaits async constructors; the replica reports ready only after warmup.
+    async def __init__(self) -> None:
         self.created = int(time.time())
         self.tokenizer = AutoTokenizer.from_pretrained(MODEL_ID, cache_dir=MODEL_CACHE_DIR)
         self.stop_token_ids = sorted(
@@ -214,7 +221,20 @@ class QwenVLLMDeployment:
             }
         )
         self.engine = AsyncLLMEngine.from_engine_args(build_engine_args())
-        logger.info("vLLM engine ready: model=%s dtype=%s device=cpu", MODEL_ID, VLLM_DTYPE)
+        await self._warmup()
+        logger.info("vLLM engine ready: model=%s dtype=%s device=cpu", MODEL_ID, MODEL_DTYPE)
+
+    async def _warmup(self) -> None:
+        # The CPU backend initializes its kernels on the first request (~7s) and compiles
+        # the sampling-penalty kernel on the first penalized request (~60s). Pay both here
+        # instead of on user requests.
+        start = time.perf_counter()
+        prompt = self._chat_prompt([{"role": "user", "content": "Hello"}])
+        params = SamplingParams(
+            max_tokens=8, repetition_penalty=1.05, stop_token_ids=self.stop_token_ids
+        )
+        await self._complete(prompt, params, f"warmup-{uuid.uuid4().hex}")
+        logger.info("Engine warmup finished in %.1fs", time.perf_counter() - start)
 
     async def check_health(self) -> None:
         # Called by Ray Serve; raising marks the replica unhealthy and triggers a restart.
