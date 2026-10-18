@@ -32,6 +32,71 @@ from vllm.outputs import RequestOutput
 
 logger = logging.getLogger("ray.serve")
 
+
+# #region agent log
+def _agent_log(hypothesis_id: str, message: str, data: dict) -> None:
+    import json
+
+    payload = {
+        "sessionId": "d26bfd",
+        "runId": "pre-fix",
+        "hypothesisId": hypothesis_id,
+        "location": "serve_script.py",
+        "message": message,
+        "data": data,
+        "timestamp": int(time.time() * 1000),
+    }
+    line = json.dumps(payload, default=str) + "\n"
+    for path in (
+        "/debug/debug-d26bfd.log",
+        "/home/mohammad/workstation/sunba91/github/qwen-k8s-serve/.cursor/debug-d26bfd.log",
+    ):
+        try:
+            with open(path, "a", encoding="utf-8") as handle:
+                handle.write(line)
+        except OSError:
+            pass
+    print("AGENT_DEBUG " + line, flush=True)
+
+
+def _cpu_ext_probe() -> dict:
+    flags = ""
+    try:
+        with open("/proc/cpuinfo", encoding="utf-8") as handle:
+            for cpu_line in handle:
+                if cpu_line.startswith("flags"):
+                    flags = cpu_line
+                    break
+    except OSError as exc:
+        flags = str(exc)
+    info = {
+        "avx2": "avx2" in flags.split(),
+        "avx512f": "avx512f" in flags.split(),
+        "libnuma": os.path.exists("/usr/lib/x86_64-linux-gnu/libnuma.so.1"),
+    }
+    try:
+        import torch
+
+        info["torch"] = torch.__version__
+        info["avx512_supported"] = bool(torch._C._cpu._is_avx512_supported())
+    except Exception as exc:
+        info["torch_error"] = f"{type(exc).__name__}: {exc}"
+        return info
+    module_name = "vllm._C" if info.get("avx512_supported") else "vllm._C_AVX2"
+    try:
+        import importlib
+
+        importlib.import_module(module_name)
+        info["extension"] = module_name
+        info["extension_ok"] = True
+    except Exception as exc:
+        info["extension"] = module_name
+        info["extension_ok"] = False
+        info["extension_error"] = f"{type(exc).__name__}: {exc}"
+    info["rms_norm"] = hasattr(torch.ops._C, "rms_norm")
+    return info
+# #endregion
+
 # --------------------------------------------------------------------------------------
 # Configuration (override through RayService runtime_env.env_vars)
 # --------------------------------------------------------------------------------------
@@ -200,7 +265,7 @@ async def validation_error_handler(request: Request, exc: RequestValidationError
 @serve.deployment(
     name="qwen-vllm",
     num_replicas=1,
-    max_concurrent_queries=MAX_CONCURRENT_QUERIES,
+    max_ongoing_requests=MAX_CONCURRENT_QUERIES,
     ray_actor_options={"num_cpus": REPLICA_NUM_CPUS},
     health_check_period_s=10,
     health_check_timeout_s=30,
@@ -208,9 +273,17 @@ async def validation_error_handler(request: Request, exc: RequestValidationError
 )
 @serve.ingress(app)
 class QwenVLLMDeployment:
-    # Ray Serve awaits async constructors; the replica reports ready only after warmup.
-    async def __init__(self) -> None:
+    # Must stay synchronous. @serve.ingress wraps this class and calls cls.__init__
+    # without awaiting it, so an async constructor never runs and leaves no engine.
+    def __init__(self) -> None:
+        # #region agent log
+        _agent_log("A", "cpu extension probe before engine init", _cpu_ext_probe())
+        # #endregion
         self.created = int(time.time())
+        self._warmed_up = False
+        self._warmup_lock = asyncio.Lock()
+        if MODEL_CACHE_DIR:
+            os.makedirs(MODEL_CACHE_DIR, exist_ok=True)
         self.tokenizer = AutoTokenizer.from_pretrained(MODEL_ID, cache_dir=MODEL_CACHE_DIR)
         self.stop_token_ids = sorted(
             {
@@ -221,8 +294,15 @@ class QwenVLLMDeployment:
             }
         )
         self.engine = AsyncLLMEngine.from_engine_args(build_engine_args())
-        await self._warmup()
         logger.info("vLLM engine ready: model=%s dtype=%s device=cpu", MODEL_ID, MODEL_DTYPE)
+
+    async def _ensure_warm(self) -> None:
+        if self._warmed_up:
+            return
+        async with self._warmup_lock:
+            if not self._warmed_up:
+                await self._warmup()
+                self._warmed_up = True
 
     async def _warmup(self) -> None:
         # The CPU backend initializes its kernels on the first request (~7s) and compiles
@@ -238,7 +318,10 @@ class QwenVLLMDeployment:
 
     async def check_health(self) -> None:
         # Called by Ray Serve; raising marks the replica unhealthy and triggers a restart.
-        await self.engine.check_health()
+        # vLLM 0.3.x AsyncLLMEngine has no check_health; later releases do.
+        check = getattr(self.engine, "check_health", None)
+        if check is not None:
+            await check()
 
     # ---------------------------------------------------------------- engine plumbing
     def _chat_prompt(self, messages: list[dict[str, str]]) -> str:
@@ -316,6 +399,7 @@ class QwenVLLMDeployment:
 
     @app.post("/generate", response_model=GenerateResponse)
     async def generate(self, req: GenerateRequest):
+        await self._ensure_warm()
         request_id = f"gen-{uuid.uuid4().hex}"
         prompt = self._chat_prompt([{"role": "user", "content": req.prompt}])
         try:
@@ -358,6 +442,7 @@ class QwenVLLMDeployment:
 
     @app.post("/v1/chat/completions")
     async def chat_completions(self, req: ChatCompletionRequest):
+        await self._ensure_warm()
         if (err := self._model_error(req.model)) is not None:
             return err
         max_tokens = self._resolve_max_tokens(req.max_completion_tokens or req.max_tokens)
@@ -457,6 +542,7 @@ class QwenVLLMDeployment:
 
     @app.post("/v1/completions")
     async def completions(self, req: CompletionRequest):
+        await self._ensure_warm()
         if (err := self._model_error(req.model)) is not None:
             return err
         max_tokens = self._resolve_max_tokens(req.max_tokens)

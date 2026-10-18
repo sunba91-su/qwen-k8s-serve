@@ -1,10 +1,11 @@
 ---
-
 apiVersion: ray.io/v1
 kind: RayService
 metadata:
-  name: qwen-ai-service
+  name: qwen-vllm-service
   namespace: default
+  labels:
+    app: qwen-vllm
 spec:
   serveConfigV2: |
     http_options:
@@ -14,123 +15,121 @@ spec:
       - name: qwen-app
         import_path: serve_script:deployment
         route_prefix: /
-        runtime_env:
-          env_vars:
-            MODEL_ID: "Qwen/Qwen2.5-0.5B-Instruct"
-            SERVED_MODEL_NAME: "Qwen/Qwen2.5-0.5B-Instruct"
-            MODEL_DTYPE: "float32"
-            MAX_MODEL_LEN: "2048"
-            MAX_NUM_SEQS: "16"
-            KV_CACHE_GIB: "0.5"
-            VLLM_CPU_OMP_THREADS_BIND: "nobind"
-            OMP_NUM_THREADS: "3"
         deployments:
           - name: qwen-vllm
             num_replicas: 1
-            max_concurrent_queries: 32
+            max_ongoing_requests: 2
             ray_actor_options:
-              num_cpus: 3
-  serveService:
-    metadata:
-      name: qwen-ai-service-serve
-    spec:
-      type: NodePort
-      ports:
-        - name: serve
-          port: 8000
-          targetPort: 8000
-          nodePort: 30800
+              num_cpus: 1
+            health_check_timeout_s: 300
+            graceful_shutdown_timeout_s: 30
   rayClusterConfig:
-    rayVersion: "2.9.3"
+    rayVersion: "2.40.0"
     headGroupSpec:
       rayStartParams:
         dashboard-host: "0.0.0.0"
-        num-cpus: "0"
-        object-store-memory: "268435456"
-        metrics-export-port: "8080"
+        num-cpus: "1"
       template:
+        metadata:
+          labels:
+            app: qwen-vllm
+            ray.io/node-type: head
         spec:
-          securityContext:
-            runAsUser: 1000
-            runAsNonRoot: true
-          volumes:
-            - name: dshm
-              emptyDir:
-                medium: Memory
-                sizeLimit: 512Mi
           containers:
             - name: ray-head
-              image: ghcr.io/sunba91-su/qwen-serve:v0.1.0
+              image: asiyabani/qwen-vllm-serve:v1
               imagePullPolicy: IfNotPresent
               ports:
-                - name: gcs
-                  containerPort: 6379
-                - name: dashboard
-                  containerPort: 8265
-                - name: client
-                  containerPort: 10001
-                - name: serve
-                  containerPort: 8000
-                - name: metrics
-                  containerPort: 8080
-              volumeMounts:
-                - name: dshm
-                  mountPath: /dev/shm
-              securityContext:
-                allowPrivilegeEscalation: false
-                capabilities:
-                  drop: ["ALL"]
+                - containerPort: 8000
+                  name: serve
+                - containerPort: 8265
+                  name: dashboard
+                - containerPort: 8080
+                  name: metrics
+              env:
+                - name: HF_ENDPOINT
+                  value: "https://hf-mirror.com"
+                - name: PYTHONPATH
+                  value: /home/ray/app
+                - name: OMP_NUM_THREADS
+                  value: "1"
+                - name: PYTHONPATH
+                  value: /home/ray/app
+                - name: OMP_NUM_THREADS
+                  value: "1"
+                - name: VLLM_CPU_OMP_THREADS_BIND
+                  value: nobind
+                - name: VLLM_CPU_KVCACHE_SPACE
+                  value: "0.25"
+                - name: KV_CACHE_GIB
+                  value: "0.25"
+                - name: MAX_MODEL_LEN
+                  value: "512"
+                - name: MAX_NUM_SEQS
+                  value: "1"
+                - name: REPLICA_NUM_CPUS
+                  value: "1"
+                - name: TORCHDYNAMO_DISABLE
+                  value: "1"
+                - name: RAY_SERVE_HTTP_REQUEST_MAX_RETRIES
+                  value: "10"
+                - name: RAY_SERVE_KV_TIMEOUT_S
+                  value: "60"
               resources:
                 requests:
                   cpu: "1"
-                  memory: 2Gi
-                limits:
-                  cpu: "2"
                   memory: 3Gi
-    workerGroupSpecs:
-      - groupName: vllm-worker
-        replicas: 1
-        minReplicas: 1
-        maxReplicas: 1
-        rayStartParams:
-          num-cpus: "3"
-          object-store-memory: "268435456"
-          metrics-export-port: "8080"
-        template:
-          spec:
-            securityContext:
-              runAsUser: 1000
-              runAsNonRoot: true
-            affinity:
-              podAntiAffinity:
-                requiredDuringSchedulingIgnoredDuringExecution:
-                  - topologyKey: kubernetes.io/hostname
-                    labelSelector:
-                      matchLabels:
-                        ray.io/node-type: head
-            volumes:
-              - name: dshm
-                emptyDir:
-                  medium: Memory
-                  sizeLimit: 512Mi
-            containers:
-              - name: ray-worker
-                image: ghcr.io/sunba91-su/qwen-serve:v0.1.0
-                imagePullPolicy: IfNotPresent
-                ports:
-                  - name: metrics
-                    containerPort: 8080
-                volumeMounts:
-                  - name: dshm
-                    mountPath: /dev/shm
-                securityContext:
-                  allowPrivilegeEscalation: false
-                  capabilities:
-                    drop: ["ALL"]
-                resources:
-                  requests:
-                    cpu: "3"
-                    memory: 7Gi
-                  limits:
-                    cpu: "3"
-                    memory: 7Gi
+                limits:
+                  cpu: "1"
+                  memory: 3Gi
+              volumeMounts:
+                - mountPath: /models
+                  name: model-cache
+          volumes:
+            - name: model-cache
+              hostPath:
+                path: /tmp/model_cache
+                type: DirectoryOrCreate
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: qwen-vllm-serve
+  namespace: default
+  labels:
+    app: qwen-vllm
+spec:
+  type: NodePort
+  selector:
+    app: qwen-vllm
+    ray.io/node-type: head
+  ports:
+    - name: serve
+      port: 8000
+      targetPort: serve
+      nodePort: 30800
+    - name: metrics
+      port: 8080
+      targetPort: metrics
+---
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: ray-service-monitor
+  namespace: monitoring
+  labels:
+    release: prometheus
+spec:
+  selector:
+    matchLabels:
+      app: qwen-vllm
+  namespaceSelector:
+    matchNames:
+      - default
+  endpoints:
+    - port: metrics
+      path: /metrics
+      interval: 15s
+    - port: serve
+      path: /metrics
+      interval: 15s
