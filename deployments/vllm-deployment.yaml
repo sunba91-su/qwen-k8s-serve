@@ -20,15 +20,15 @@ spec:
             num_replicas: 1
             max_ongoing_requests: 2
             ray_actor_options:
-              num_cpus: 1
-            health_check_timeout_s: 300
-            graceful_shutdown_timeout_s: 30
+              num_cpus: 2
+            health_check_timeout_s: 1800
+            graceful_shutdown_timeout_s: 60
   rayClusterConfig:
     rayVersion: "2.40.0"
     headGroupSpec:
       rayStartParams:
         dashboard-host: "0.0.0.0"
-        num-cpus: "1"
+        num-cpus: "2"
       template:
         metadata:
           labels:
@@ -37,7 +37,7 @@ spec:
         spec:
           containers:
             - name: ray-head
-              image: asiyabani/qwen-vllm-serve:v1
+              image: asiyabani/qwen-vllm-serve:v2
               imagePullPolicy: IfNotPresent
               ports:
                 - containerPort: 8000
@@ -47,11 +47,21 @@ spec:
                 - containerPort: 8080
                   name: metrics
               env:
-                - name: HF_ENDPOINT
-                  value: "https://hf-mirror.com"
-                - name: PYTHONPATH
-                  value: /home/ray/app
-                - name: OMP_NUM_THREADS
+                - name: MODEL_ID
+                  value: "Qwen/Qwen2.5-0.5B-Instruct"
+                - name: HF_HOME
+                  value: "/models"
+                - name: HF_HUB_CACHE
+                  value: "/models"
+                - name: SWAP_SPACE
+                  value: "0"
+                - name: swap_space
+                  value: "0"
+                - name: TRANSFORMERS_OFFLINE
+                  value: "1"
+                - name: HF_HUB_OFFLINE
+                  value: "1"
+                - name: HF_DATASETS_OFFLINE
                   value: "1"
                 - name: PYTHONPATH
                   value: /home/ray/app
@@ -60,9 +70,9 @@ spec:
                 - name: VLLM_CPU_OMP_THREADS_BIND
                   value: nobind
                 - name: VLLM_CPU_KVCACHE_SPACE
-                  value: "0.25"
+                  value: "1"
                 - name: KV_CACHE_GIB
-                  value: "0.25"
+                  value: "1"
                 - name: MAX_MODEL_LEN
                   value: "512"
                 - name: MAX_NUM_SEQS
@@ -74,21 +84,21 @@ spec:
                 - name: RAY_SERVE_HTTP_REQUEST_MAX_RETRIES
                   value: "10"
                 - name: RAY_SERVE_KV_TIMEOUT_S
-                  value: "60"
+                  value: "300"
               resources:
                 requests:
-                  cpu: "1"
-                  memory: 3Gi
+                  cpu: "2"
+                  memory: 6Gi
                 limits:
-                  cpu: "1"
-                  memory: 3Gi
+                  cpu: "2"
+                  memory: 6Gi
               volumeMounts:
                 - mountPath: /models
                   name: model-cache
           volumes:
             - name: model-cache
               hostPath:
-                path: /tmp/model_cache
+                path: /opt/models/hub
                 type: DirectoryOrCreate
 ---
 apiVersion: v1

@@ -1,14 +1,11 @@
-FROM registry.apk-group.net/mirror/rayproject/ray:2.40.0-py310-cpu
+FROM mirror.asiyabani.id.ir/rayproject/ray:2.40.0-py310-cpu
 ENV PYTHONUNBUFFERED=1 \
     RAY_SERVE_ENABLE_EXPERIMENTAL_STREAMING=1 \
     MODEL_ID="Qwen/Qwen2.5-0.5B-Instruct" \
     MODEL_CACHE_DIR="/models" \
     VLLM_CPU_KVCACHE_SPACE=1 \
     VLLM_CPU_OMP_THREADS_BIND=nobind \
-    OMP_NUM_THREADS=4 \
-    HTTPS_PROXY=socks5://172.25.4.4:2283 \
-    HTTP_PROXY=socks5://172.25.4.4:2283 \
-    ALL_PROXY=socks5://172.25.4.4:2283 
+    OMP_NUM_THREADS=4 
 
 
 USER root
@@ -25,7 +22,7 @@ RUN pip install --no-cache-dir -r requirements.txt \
     && pip install --no-cache-dir --force-reinstall \
         "numpy==2.2.6" "pandas==2.2.3" "pyarrow==17.0.0" \
         "scipy==1.15.3" "fastapi==0.139.1"
-
+RUN pip install "numpy<2.0.0" "pyarrow>=14.0.1" --upgrade
 COPY --chown=ray:users serve_script.py serve_config.yaml ./
 
 EXPOSE 8000
