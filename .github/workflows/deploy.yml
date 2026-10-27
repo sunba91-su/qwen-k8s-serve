@@ -1,0 +1,28 @@
+name: Deploy Model to Kubernetes
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - 'kubernetes/**'
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Set up Kubeconfig
+        run: |
+          mkdir -p ~/.kube
+          echo "${{ secrets.KUBECONFIG_DATA }}" > ~/.kube/config
+          chmod 600 ~/.kube/config
+
+      - name: Install Helm
+        uses: azure/setup-helm@v4.2.0
+
+      - name: Deploy using Kubectl
+        run: |
+          kubectl apply -f ./kubernetes/vllm-deployment.yaml

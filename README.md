@@ -1,565 +1,383 @@
-# qwen-k8s-serve — AIOps Text Generation Cloud Service
+# qwen-k8s-serve
 
-> A production-like, fully automated Text Generation API serving **Qwen2.5-0.5B-Instruct** on a
-> CPU-only, 3-node Kubernetes cluster with **KubeRay**, **Ray Serve**, and **vLLM** — provisioned
-> with Infrastructure as Code, shipped through CI/CD, and observed end-to-end with Prometheus and Grafana.
+CPU-only text generation with Qwen2.5, vLLM, Ray Serve, and Kubernetes, developed for the **ArvanCloud SRE technical challenge**.
 
-[![License](https://img.shields.io/badge/license-Apache%202.0-blue.svg)](LICENSE)
-![Kubernetes](https://img.shields.io/badge/Kubernetes-kubeadm-326CE5?logo=kubernetes&logoColor=white)
-![Terraform](https://img.shields.io/badge/IaC-Terraform-7B42BC?logo=terraform&logoColor=white)
-![Ansible](https://img.shields.io/badge/Config-Ansible-EE0000?logo=ansible&logoColor=white)
-![Ray](https://img.shields.io/badge/Serving-Ray%20Serve%20%2B%20vLLM-028CF0)
+The repository covers building an Ubuntu golden image, provisioning three ArvanCloud VMs with Terraform, bootstrapping Kubernetes with Ansible, and deploying a single model-serving replica through KubeRay. A FastAPI application provides a small generation API and a subset of the OpenAI completions API.
 
-> **Status:** 🚧 Work in progress — progress is tracked in [ROADMAP.md](ROADMAP.md).
+**Status:** the repository contains the infrastructure and serving implementation, a manifest deployment workflow, a ServiceMonitor, and a basic load-test script. Several setup steps remain manual. Live availability, monitoring coverage, and performance results must be verified against the deployed environment; this README does not claim an end-to-end validated rebuild or production readiness.
 
----
+## Contents
 
-## Table of Contents
-
-- [Overview](#overview)
 - [Architecture](#architecture)
-- [Technology Stack](#technology-stack)
-- [Repository Structure](#repository-structure)
+- [Repository layout](#repository-layout)
 - [Prerequisites](#prerequisites)
-- [Quick Start / Deployment Guide](#quick-start--deployment-guide)
-- [API Usage](#api-usage)
-- [CI/CD](#cicd)
-- [Monitoring & Observability](#monitoring--observability)
-- [Load Testing & Benchmarking](#load-testing--benchmarking)
-- [Security Considerations](#security-considerations)
+- [Deployment](#deployment)
+- [API usage](#api-usage)
+- [Delivery workflow](#delivery-workflow)
+- [Monitoring](#monitoring)
+- [Load testing](#load-testing)
+- [Troubleshooting](#troubleshooting)
+- [Security and limitations](#security-and-limitations)
 - [Teardown](#teardown)
-- [AI Usage Disclosure](#ai-usage-disclosure)
-- [Author](#author)
-- [License](#license)
-
----
-
-## Overview
-
-This repository is my submission for the **ArvanCloud Site Reliability Engineering technical challenge**.
-The objective is to design, provision, and operate a scalable text generation service the way it would
-be run in production: reproducible infrastructure, declarative deployments, automated delivery,
-measurable reliability, and data-driven performance tuning.
-
-**Key capabilities**
-
-| Capability | Implementation |
-|------------|----------------|
-| Infrastructure | 3 VMs provisioned by Terraform, configured into a Kubernetes cluster by Ansible |
-| Model serving | `Qwen/Qwen2.5-0.5B-Instruct` on vLLM (CPU backend), orchestrated by Ray Serve on KubeRay, 1 replica |
-| Custom API | `POST /generate` — `prompt` + `max_new_tokens` (≤ 64) → `{"text": "..."}` |
-| OpenAI compatibility | `/v1/models`, `/v1/chat/completions`, `/v1/completions` (incl. streaming) |
-| Delivery | GitHub Actions: lint → test → build → scan → deploy → smoke test |
-| Observability | kube-prometheus-stack, Ray & vLLM metrics, provisioned Grafana dashboards, alerting |
-| Reliability | k6 load tests with randomized prompts, resource tuning, before/after benchmarks |
-
----
+- [AI usage and license](#ai-usage-and-license)
 
 ## Architecture
 
-### High-level view
+Terraform defines one control-plane VM (`k8s-master-01`) and two worker VMs (`k8s-worker-01` and `k8s-worker-02`). Ansible installs Kubernetes packages from the v1.28 repository, initializes the control plane with kubeadm, installs Calico v3.26.1, and joins the workers. The golden image supplies containerd with the systemd cgroup driver.
 
-```mermaid
-flowchart LR
-    client["Client<br/>curl / OpenAI SDK / k6"]
+The application manifest defines a `RayService` named `qwen-vllm-service` in the `default` namespace. It contains **one Ray head and no Ray worker groups**. The single Serve replica and vLLM engine therefore run on the Ray head. Kubernetes chooses its node; the manifest has no node affinity, node selector, or inference-specific tolerations.
 
-    subgraph cicd["CI/CD - GitHub Actions"]
-        ci["Lint, Test, Build, Scan"]
-        cd["Deploy and Smoke Test"]
-    end
+Requests enter through the `qwen-vllm-serve` NodePort Service on port **30800**, reach the Ray Serve HTTP proxy on port 8000, and are routed to the FastAPI ingress and vLLM engine. No Ingress or TLS configuration is committed.
 
-    registry[("Container Registry")]
+Model files come from the node-local directory `/opt/models/hub`, mounted at `/models`. Offline Hugging Face settings require that cache to be populated before startup. There is no PVC, download Job, or init container. Rescheduling onto a different node requires the cache to exist there too.
 
-    subgraph iac["Infrastructure as Code"]
-        tf["Terraform<br/>VMs, network, firewall"]
-        ans["Ansible<br/>containerd, kubeadm, CNI"]
-    end
+### Runtime configuration
 
-    subgraph k8s["Kubernetes Cluster - 3 nodes, CPU only"]
-        direction TB
-        ingress["Ingress NGINX"]
+The committed configuration uses:
 
-        subgraph cp["k8s-cp-01 - control plane"]
-            api["kube-apiserver, etcd,<br/>scheduler, controller-manager"]
-        end
+- Model: `Qwen/Qwen2.5-0.5B-Instruct`, CPU inference, default dtype `float32`.
+- Runtime: Ray 2.40.0, Python 3.10 base image, vLLM 0.17.0 CPU wheel.
+- Ray head container: requests and limits of 2 CPU and 6 GiB memory.
+- Serve: one replica, 2 logical Ray CPUs, `max_ongoing_requests: 2`.
+- Engine: `MAX_MODEL_LEN=512`, `MAX_NUM_SEQS=1`, `KV_CACHE_GIB=1`.
+- CPU threading: `OMP_NUM_THREADS=1`, `VLLM_CPU_OMP_THREADS_BIND=nobind`.
 
-        subgraph w1["k8s-worker-01 - platform"]
-            operator["KubeRay Operator"]
-            rayhead["Ray Head<br/>GCS, Dashboard, Serve Controller,<br/>HTTP Proxy"]
-            prom["Prometheus"]
-            graf["Grafana"]
-        end
+The manifest's Serve configuration overrides the Python deployment's CPU allocation, despite `REPLICA_NUM_CPUS=1` in the container environment. Python defaults also differ from Kubernetes settings; inspect [serve_script.py](endpoint/serve_script.py), [Dockerfile](endpoint/Dockerfile), and [vllm-deployment.yaml](kubernetes/vllm-deployment.yaml) together when tuning.
 
-        subgraph w2["k8s-worker-02 - inference, tainted"]
-            rayworker["Ray Worker<br/>Serve Replica x1<br/>FastAPI + vLLM AsyncLLMEngine"]
-            pvc[("Model Cache PVC<br/>Qwen2.5-0.5B-Instruct")]
-        end
-    end
+A single control plane and a single serving replica are availability constraints. The cloud VM `ha_enabled` setting does not make the Kubernetes control plane or application highly available.
 
-    tf --> ans --> k8s
-    ci --> registry
-    cd --> api
-    registry -. image pull .-> rayworker
-    client -->|HTTPS| ingress --> rayhead --> rayworker
-    rayworker --- pvc
-    operator -. reconciles RayService .-> rayhead
-    operator -. reconciles RayService .-> rayworker
-    prom -. scrapes .-> rayhead
-    prom -. scrapes .-> rayworker
-    graf --> prom
-```
+## Repository layout
 
-### Request flow
-
-```mermaid
-sequenceDiagram
-    autonumber
-    participant C as Client
-    participant I as Ingress NGINX
-    participant P as Ray Serve HTTP Proxy
-    participant R as Serve Replica - FastAPI
-    participant V as vLLM Engine - CPU
-
-    C->>I: POST /generate {prompt, max_new_tokens}
-    I->>P: Forward to RayService serve Service :8000
-    P->>R: Route request, respecting max_ongoing_requests
-    R->>R: Validate input, apply Qwen chat template
-    R->>V: generate(prompt, SamplingParams)
-    V-->>R: Generated tokens, continuous batching
-    R-->>P: {"text": "..."}
-    P-->>I: 200 OK
-    I-->>C: JSON response
-```
-
-### Design decisions
-
-- **Node roles.** The control plane is kept free of workloads. Platform services (Ray head, KubeRay operator, monitoring) run on `k8s-worker-01`; `k8s-worker-02` is tainted `workload=inference:NoSchedule` so the vLLM replica has dedicated, uncontended CPU.
-- **Ray head does no inference.** The head is started with `num-cpus: 0`, so Ray only schedules Serve replicas on the worker group.
-- **Single-replica serving.** The challenge mandates 1 replica; throughput is gained through vLLM continuous batching and CPU tuning rather than horizontal scaling. The `RayService` is ready for Serve autoscaling if the constraint is lifted.
-- **Model pre-staging.** Weights are downloaded once into a PVC, removing Hugging Face from the critical path of pod restarts.
-- **Back-pressure over queueing.** Ray Serve `max_ongoing_requests` / `max_queued_requests` bound in-flight work and return `503` under overload instead of letting latency grow without limit.
-
----
-
-## Technology Stack
-
-| Layer | Technology | Purpose |
-|-------|------------|---------|
-| Infrastructure as Code | **Terraform** | Provision VMs, private network, security groups, SSH keys; generate Ansible inventory |
-| Configuration management | **Ansible** | OS hardening, containerd, kubeadm cluster bootstrap, add-ons |
-| Container orchestration | **Kubernetes** (kubeadm) | 3-node cluster: 1 control plane, 2 workers |
-| Networking | **Calico** / **Cilium**, **ingress-nginx** | Pod networking, network policies, north-south traffic |
-| Storage | **local-path-provisioner** | PVCs for model cache and Prometheus TSDB |
-| Distributed compute | **KubeRay** | Operator managing the `RayService` lifecycle (incl. zero-downtime upgrades) |
-| Model serving | **Ray Serve** | HTTP proxy, routing, replica management, back-pressure |
-| Inference engine | **vLLM** (CPU backend) | Continuous batching, PagedAttention KV-cache, OpenAI-compatible protocol |
-| Model | **Qwen/Qwen2.5-0.5B-Instruct** | 0.5B-parameter instruction-tuned LLM |
-| API framework | **FastAPI** + Pydantic | `/generate` and OpenAI-compatible endpoints with schema validation |
-| Monitoring | **Prometheus** (kube-prometheus-stack) | Metrics collection, recording and alerting rules |
-| Visualization | **Grafana** | Dashboards provisioned as code |
-| CI/CD | **GitHub Actions** | Lint, test, build, scan, deploy, smoke test |
-| Security scanning | **Trivy**, **gitleaks** | Image vulnerability and secret scanning |
-| Load testing | **k6** | Randomized-prompt load, stress, and soak scenarios |
-
----
-
-## Repository Structure
-
-```
+```text
 .
-├── terraform/              # VM, network, firewall, SSH key provisioning
-│   ├── modules/node/
-│   └── environments/prod/
-├── ansible/                # Node preparation and kubeadm cluster bootstrap
-│   ├── inventory/          # Generated by Terraform
-│   ├── roles/
-│   └── site.yml
-├── docker/                 # Ray + vLLM CPU runtime image
-├── serve/                  # Ray Serve application (FastAPI ingress + vLLM engine)
-│   ├── app/
-│   └── tests/
-├── k8s/                    # Kubernetes manifests and Helm values
-│   ├── base/
-│   ├── kuberay/
-│   ├── rayservice/
-│   └── ingress/
-├── monitoring/             # ServiceMonitors, PodMonitors, alert rules, Grafana dashboards
-├── loadtest/               # k6 scenarios and random prompt corpus
-├── benchmarks/             # Raw results and before/after report
-├── docs/                   # Architecture, runbook, access guide
-├── .github/workflows/      # CI/CD pipelines
-├── Makefile                # Single entry point for all operations
-├── ROADMAP.md
-├── ai-usage.md
+├── golden-image/
+│   ├── golden-image.pkr.hcl   # Packer QEMU image build
+│   ├── dependecies.sh         # OS packages and containerd configuration
+│   └── cloud-data/            # NoCloud initialization data
+├── terraform/
+│   ├── main.tf               # Three ArvanCloud VM resources
+│   ├── variables.tf
+│   ├── outputs.tf
+│   └── terraform.tfvars.example
+├── ansible/
+│   ├── k8s-setup.yml          # OS networking, kubeadm, Calico, worker join
+│   └── inventory.ini.example
+├── endpoint/
+│   ├── Dockerfile
+│   ├── requirements.txt
+│   ├── serve_config.yaml     # Standalone Ray Serve configuration
+│   └── serve_script.py       # FastAPI ingress and vLLM integration
+├── kubernetes/
+│   └── vllm-deployment.yaml   # RayService, NodePort Service, ServiceMonitor
+├── load-test/
+│   ├── env.example
+│   └── load_test.sh
+├── .github/workflows/deploy.yml
+├── docs/ai-usage.md
+├── LICENSE
 └── README.md
 ```
 
----
-
 ## Prerequisites
 
-### Accounts & access
+On the operator workstation, install Git, Packer with its QEMU plugin, QEMU and the tools needed to create the NoCloud CD image, Terraform, Ansible, kubectl, Helm, Docker, Python with pip, and an SSH client. The load test requires Bash, curl, seq, and xargs. Tool versions are not comprehensively pinned in this repository.
 
-- A cloud account with API credentials (ArvanCloud IaaS or any Terraform-supported provider)
-- A container registry (GHCR or ArvanCloud Container Registry)
-- An SSH key pair for node access
-- *(Optional)* A DNS record pointing to the ingress public IP for TLS
+You also need:
 
-### Recommended node sizing
+- An ArvanCloud account, API key, an uploaded SSH public key, and capacity for three VMs.
+- An uploaded custom image built from `golden-image/`.
+- An existing security group suitable for the cluster. Replace the hard-coded security-group IDs in `terraform/main.tf` with IDs from your account and review its rules.
+- A registry you can push to and the cluster can pull from. The Dockerfile currently uses a custom mirror for its Ray base image; replace it if unavailable.
+- Network access to package repositories, image registries, and model files during preparation.
+- CPU instruction support compatible with the vLLM CPU wheel. Inspect `lscpu` on candidate hosts and validate engine startup before running benchmarks.
 
-| Node | Role | vCPU | RAM | Disk |
-|------|------|------|-----|------|
-| `k8s-cp-01` | Control plane | 4 | 8 GiB | 50 GiB |
-| `k8s-worker-01` | Ray head, operator, monitoring, ingress | 8 | 16 GiB | 80 GiB |
-| `k8s-worker-02` | Ray worker — vLLM inference | 8 | 16 GiB | 80 GiB |
+Terraform defaults to region `ir-thr-c2`. It requests flavor `g3-4-2-0` with a 40 GiB disk for the control plane and `g4-8-4-0` with 60 GiB disks for both workers. Confirm the actual CPU and RAM specifications and flavor availability in your account. Terraform references existing SSH keys and security groups; it does not create those resources or a private network.
 
-> vLLM's CPU backend benefits significantly from **AVX-512** (and AMX/BF16 where available).
-> Verify with `lscpu | grep -E 'avx512|avx2|amx'`.
+## Deployment
 
-### Local tooling
+Run commands from the repository root unless a step explicitly changes directory. These steps describe the committed implementation and call out the configuration and external prerequisites needed to reproduce it.
 
-| Tool | Minimum version |
-|------|-----------------|
-| Terraform | 1.6 |
-| Ansible | 2.15 (ansible-core) |
-| kubectl | 1.30 |
-| Helm | 3.14 |
-| Docker / Podman | 24 / 4.9 |
-| k6 | 0.50 |
-| Python | 3.11 |
-| GNU Make | 4.x |
+### 1. Build and upload the golden image
 
----
+The Packer template starts from an Ubuntu 22.04 cloud image. Its shell provisioner installs containerd and sets `SystemdCgroup = true`.
 
-## Quick Start / Deployment Guide
-
-Every step below is automated; `make all` runs the full sequence. The individual steps are listed for
-transparency and troubleshooting.
-
-### 1. Clone and configure
+**Before building:** replace the fixed build password in both the Packer template and `cloud-data/user-data`. Password-based SSH is enabled by the committed cloud-init configuration. Ensure temporary build credentials are removed and password login is disabled in the image used for deployment; the current scripts do not automate this cleanup.
 
 ```bash
-git clone git@github.com:sunba91-su/qwen-k8s-serve.git
-cd qwen-k8s-serve
-
-cp .env.example .env              # cloud credentials, registry, domain - never committed
-set -a && source .env && set +a
+cd golden-image
+packer init .
+packer validate .
+packer build .
+cd ..
 ```
 
-### 2. Provision infrastructure (Terraform)
+The output is `golden-image/output-image/k8s-golden-image.qcow2`. Upload it as a custom image to ArvanCloud using your account's image workflow and record its image ID. Uploading is a manual step outside the Terraform configuration.
+
+### 2. Provision the VMs
 
 ```bash
-cd terraform/environments/prod
-terraform init
-terraform plan -out=tfplan
-terraform apply tfplan
-cd -
+cp terraform/terraform.tfvars.example terraform/terraform.tfvars
 ```
 
-Terraform outputs the node IPs and writes the Ansible inventory to `ansible/inventory/hosts.ini`.
+Set `region`, `ssh_key_name`, and `image_id` in that file. Remove its placeholder `arvan_api_key` assignment if supplying the key through `TF_VAR_arvan_api_key`; Terraform variable files take precedence over environment variables. Keep actual credentials out of committed files.
 
-### 3. Bootstrap Kubernetes (Ansible)
+After replacing the security-group IDs in `terraform/main.tf`:
 
 ```bash
-cd ansible
-ansible all -m ping
-ansible-playbook site.yml
-cd -
+terraform -chdir=terraform init
+terraform -chdir=terraform plan -out=tfplan
+terraform -chdir=terraform apply tfplan
+terraform -chdir=terraform output -json
+```
 
-export KUBECONFIG=$PWD/kubeconfig   # fetched from the control plane by the playbook
+The outputs named `master_ip` and `worker_ips` currently contain complete server objects, rather than plain IP strings. Identify the public addresses from those objects or the cloud console and use them to populate the inventory. Terraform does not generate the inventory automatically.
+
+State is local: no remote backend is configured. Protect the state and plan files, which can contain sensitive information. The generated `terraform/tfplan` path is not covered by the current `.gitignore`; do not commit it.
+
+### 3. Bootstrap Kubernetes
+
+```bash
+cp ansible/inventory.ini.example ansible/inventory.ini
+```
+
+Replace the example addresses, SSH key path, and registry credentials. The playbook assumes an `ubuntu` user and an existing containerd installation from the golden image. Check that swap is disabled on the target nodes; the playbook does not disable it.
+
+```bash
+ansible all -i ansible/inventory.ini -m ping
+ansible-playbook -i ansible/inventory.ini ansible/k8s-setup.yml
+```
+
+The playbook configures registry access, initializes kubeadm using an alternate image repository, installs Calico from a remote manifest, and joins the workers. It holds the installed Kubernetes packages, but does not pin an exact patch version.
+
+It copies kubeconfig to `/home/ubuntu/.kube/config` on the control plane. Fetch it manually, substituting your SSH key and control-plane address:
+
+```bash
+mkdir -p "$HOME/.kube"
+scp -i /path/to/ssh-key ubuntu@CONTROL_PLANE_IP:/home/ubuntu/.kube/config "$HOME/.kube/qwen-k8s-serve"
+chmod 600 "$HOME/.kube/qwen-k8s-serve"
+export KUBECONFIG="$HOME/.kube/qwen-k8s-serve"
 kubectl get nodes -o wide
 ```
 
-Expected result: three nodes in `Ready` state.
+Confirm the kubeconfig server address is reachable from your workstation and, for automated deployment, from the GitHub Actions runner. Avoid storing kubeconfig in the repository; the current ignore rules do not exclude it.
 
-### 4. Install cluster add-ons and monitoring
+### 4. Prepare cluster operators
 
-```bash
-make addons        # CNI, ingress-nginx, local-path-provisioner, metrics-server
-make monitoring    # kube-prometheus-stack + Ray/vLLM monitors + Grafana dashboards
-```
-
-### 5. Build and push the serving image
-
-```bash
-export IMAGE=ghcr.io/sunba91-su/qwen-k8s-serve:$(git rev-parse --short HEAD)
-docker build -t "$IMAGE" -f docker/Dockerfile .
-docker push "$IMAGE"
-```
-
-> In normal operation this step is performed by the CD pipeline.
-
-### 6. Deploy KubeRay and the model
+Install a KubeRay operator version compatible with the committed Ray configuration. No chart version or values file is pinned in this repository; select and record the version you validate:
 
 ```bash
 helm repo add kuberay https://ray-project.github.io/kuberay-helm/
+helm repo update
+# Set KUBERAY_CHART_VERSION to the version selected for your environment.
 helm upgrade --install kuberay-operator kuberay/kuberay-operator \
   --namespace ray-system --create-namespace \
-  -f k8s/kuberay/values.yaml
-
-kubectl apply -k k8s/rayservice/
-
-kubectl -n llm get rayservice qwen-serve -w
+  --version "$KUBERAY_CHART_VERSION"
+kubectl get crd rayservices.ray.io
 ```
 
-Wait until the `RayService` reports `Running` and the Serve application is `HEALTHY`. The first start
-takes several minutes while the model is staged into the PVC and loaded by vLLM.
+The application YAML also contains a `ServiceMonitor`. Before applying the complete file, install Prometheus Operator's ServiceMonitor CRD and create the `monitoring` namespace. Prometheus/Grafana installation manifests and Helm values are not included. See [Monitoring](#monitoring) for selection requirements. Without these prerequisites, applying the complete YAML can fail after creating some resources.
 
-### 7. Verify
+### 5. Build and publish the runtime image
+
+Use `endpoint/` as the Docker build context:
 
 ```bash
-export API_URL=https://api.example.com   # or http://<ingress-ip>
-curl -s "$API_URL/healthz"
-curl -s "$API_URL/v1/models" | jq
+export IMAGE=YOUR_REGISTRY/qwen-vllm-serve:YOUR_UNIQUE_TAG
+docker build -t "$IMAGE" endpoint/
+docker push "$IMAGE"
 ```
 
----
+Replace `asiyabani/qwen-vllm-serve:v2` in the application manifest with that image reference. Configure pull credentials separately if your registry is private.
 
-## API Usage
+The Dockerfile has overlapping dependency installation steps: it installs NumPy 2.2.6 and later overrides it with `numpy<2.0.0`. Its final environment is therefore not identical to `requirements.txt`, and some dependencies remain ranges. Validate a fresh build and model startup; a reproducible dependency lock is not supplied.
 
-| Method | Path | Description |
-|--------|------|-------------|
-| `POST` | `/generate` | Simple text generation |
-| `GET` | `/v1/models` | List served models (OpenAI-compatible) |
-| `POST` | `/v1/chat/completions` | Chat completions (OpenAI-compatible, supports `stream`) |
-| `POST` | `/v1/completions` | Text completions (OpenAI-compatible) |
-| `GET` | `/healthz` | Liveness |
-| `GET` | `/readyz` | Readiness (model loaded) |
+### 6. Pre-stage the model cache
 
-### `POST /generate`
-
-**Request body**
-
-| Field | Type | Required | Constraints |
-|-------|------|----------|-------------|
-| `prompt` | string | yes | Non-empty |
-| `max_new_tokens` | integer | no | `1`–`64`, default `64` |
+On a machine with access to Hugging Face, create a cache with the standard Hugging Face layout:
 
 ```bash
-curl -s -X POST "$API_URL/generate" \
-  -H "Content-Type: application/json" \
-  -d '{
-        "prompt": "Explain what a Kubernetes operator is in one sentence.",
-        "max_new_tokens": 64
-      }' | jq
-```
-
-**Response — `200 OK`**
-
-```json
-{
-  "text": "A Kubernetes operator is a controller that extends the Kubernetes API to automate the lifecycle management of complex, stateful applications."
-}
-```
-
-**Validation error — `422 Unprocessable Entity`** (e.g. `max_new_tokens: 128`)
-
-```json
-{
-  "detail": [
-    {
-      "type": "less_than_equal",
-      "loc": ["body", "max_new_tokens"],
-      "msg": "Input should be less than or equal to 64",
-      "input": 128
-    }
-  ]
-}
-```
-
-### OpenAI-compatible: Chat Completions
-
-```bash
-curl -s "$API_URL/v1/chat/completions" \
-  -H "Content-Type: application/json" \
-  -d '{
-        "model": "Qwen/Qwen2.5-0.5B-Instruct",
-        "messages": [
-          {"role": "system", "content": "You are a concise SRE assistant."},
-          {"role": "user", "content": "What is an error budget?"}
-        ],
-        "max_tokens": 64,
-        "temperature": 0.7
-      }' | jq
-```
-
-**Streaming (Server-Sent Events)**
-
-```bash
-curl -N "$API_URL/v1/chat/completions" \
-  -H "Content-Type: application/json" \
-  -d '{
-        "model": "Qwen/Qwen2.5-0.5B-Instruct",
-        "messages": [{"role": "user", "content": "List three SLIs for an LLM API."}],
-        "max_tokens": 64,
-        "stream": true
-      }'
-```
-
-### OpenAI-compatible: Completions
-
-```bash
-curl -s "$API_URL/v1/completions" \
-  -H "Content-Type: application/json" \
-  -d '{
-        "model": "Qwen/Qwen2.5-0.5B-Instruct",
-        "prompt": "The three pillars of observability are",
-        "max_tokens": 32
-      }' | jq
-```
-
-### OpenAI Python SDK
-
-```python
-from openai import OpenAI
-
-client = OpenAI(base_url="https://api.example.com/v1", api_key="not-needed")
-
-response = client.chat.completions.create(
-    model="Qwen/Qwen2.5-0.5B-Instruct",
-    messages=[{"role": "user", "content": "Give me one tip for reducing MTTR."}],
-    max_tokens=64,
+python3 -m venv /tmp/qwen-model-download
+/tmp/qwen-model-download/bin/pip install huggingface_hub
+/tmp/qwen-model-download/bin/python - <<'PY'
+from huggingface_hub import snapshot_download
+snapshot_download(
+    repo_id="Qwen/Qwen2.5-0.5B-Instruct",
+    cache_dir="/tmp/qwen-model-cache",
 )
-print(response.choices[0].message.content)
+PY
 ```
 
----
+Copy the **contents** of `/tmp/qwen-model-cache/` into `/opt/models/hub/` on every Kubernetes node eligible to host the Ray head, preserving the `models--Qwen--Qwen2.5-0.5B-Instruct` directory, blobs, refs, and snapshot symlinks. Ensure the image's `ray` user can read the cache and access the mounted directory.
 
-## CI/CD
+This distribution is manual. An empty `hostPath` directory will be created automatically if missing, but the model cannot load from that empty directory in offline mode. Model revision pinning and automated cache staging are not implemented.
 
-Pipelines live in [`.github/workflows/`](.github/workflows/).
-
-```mermaid
-flowchart LR
-    pr["Pull Request"] --> lint["Lint<br/>terraform fmt/validate, tflint,<br/>ansible-lint, yamllint, ruff"]
-    lint --> validate["Validate<br/>kubeconform on rendered manifests"]
-    validate --> test["Unit tests<br/>pytest"]
-    test --> build["Build image<br/>+ Trivy scan"]
-    build --> merge{"Merge to main"}
-    merge --> push["Push image<br/>tag = git SHA"]
-    push --> deploy["Deploy RayService"]
-    deploy --> smoke["Smoke test<br/>/generate + /v1/chat/completions"]
-    smoke -->|fail| rollback["Rollback + alert"]
-```
-
-| Workflow | Trigger | Responsibility |
-|----------|---------|----------------|
-| `ci.yml` | Pull request | Static analysis, manifest validation, unit tests, image build and scan |
-| `cd.yml` | Push to `main` | Push image, deploy `RayService`, smoke test, rollback on failure |
-| `infra.yml` | Changes under `terraform/` | `terraform plan` on PR; manually approved `apply` |
-
-Cluster credentials are stored as encrypted repository secrets and bound to a least-privilege
-ServiceAccount scoped to the application namespace.
-
----
-
-## Monitoring & Observability
-
-The monitoring stack is based on **kube-prometheus-stack**. Ray and vLLM metrics are scraped via
-`PodMonitor` / `ServiceMonitor` resources, and all Grafana dashboards are provisioned from
-[`monitoring/dashboards/`](monitoring/dashboards/).
+### 7. Deploy and verify generation
 
 ```bash
-kubectl -n monitoring port-forward svc/kube-prometheus-stack-grafana 3000:80
-# open http://localhost:3000
+kubectl apply -f kubernetes/vllm-deployment.yaml
+kubectl -n default get rayservice qwen-vllm-service
+kubectl -n default get pods -l app=qwen-vllm -o wide
+kubectl -n default get svc qwen-vllm-serve
 ```
 
-### Dashboards
-
-| Dashboard | Key signals |
-|-----------|-------------|
-| **Cluster Overview** | Node CPU / memory / disk / network, pod restarts, requests vs. actual usage |
-| **Ray Cluster & Serve** | Ray resources, Serve replica health, request rate, Serve latency, error rate |
-| **LLM Inference (vLLM)** | Generation tokens/s, TTFT p50/p95/p99, time per output token, running vs. waiting requests, KV-cache utilization |
-| **API SLO** | Availability, 5xx ratio, latency vs. objective, error-budget burn rate |
-
-### Alerting (examples)
-
-| Alert | Condition |
-|-------|-----------|
-| `RayServeReplicaUnhealthy` | Serve replica not healthy for > 2 min |
-| `LLMHighErrorRate` | 5xx ratio > 5% over 5 min |
-| `LLMLatencySLOBreach` | p95 `/generate` latency above objective for 10 min |
-| `NodeMemoryPressure` | Node available memory < 10% |
-| `PodOOMKilled` | Any container terminated with `OOMKilled` |
-
----
-
-## Load Testing & Benchmarking
-
-Load tests use **k6** with a corpus of randomized prompts ([`loadtest/prompts.json`](loadtest/prompts.json))
-and a random `max_new_tokens` in the range 1–64 per request.
+Inspect RayService status and container logs until the Serve deployment is healthy. For local verification without opening the NodePort externally, run this in a separate terminal:
 
 ```bash
-k6 run -e API_URL="$API_URL" loadtest/smoke.js     # sanity check, 1 VU
-k6 run -e API_URL="$API_URL" loadtest/load.js      # ramp to target concurrency, sustained
-k6 run -e API_URL="$API_URL" loadtest/stress.js    # find the saturation point
+kubectl -n default port-forward svc/qwen-vllm-serve 8000:8000
 ```
 
-### Methodology
+Then test both routing and inference:
 
-1. **Baseline:** run the suite against the default, untuned deployment; store results in `benchmarks/before/`.
-2. **Optimize:** change one variable at a time and record each experiment in `benchmarks/experiments.md`:
-   - right-sized CPU/memory requests and limits, Guaranteed QoS with static CPU manager pinning
-   - vLLM CPU tuning: `VLLM_CPU_KVCACHE_SPACE`, `VLLM_CPU_OMP_THREADS_BIND`, `max_num_seqs`, `max_num_batched_tokens`, `max_model_len`
-   - Ray Serve concurrency: `max_ongoing_requests`, timeouts; Ray head `num-cpus: 0`
-   - workload isolation through taints, tolerations, and node affinity
-3. **After:** re-run the identical suite; store results in `benchmarks/after/`.
-4. **Report:** analysis and Grafana snapshots in [`benchmarks/REPORT.md`](benchmarks/REPORT.md).
+```bash
+export API_URL=http://127.0.0.1:8000
+curl --fail-with-body "$API_URL/healthz"
+curl --fail-with-body "$API_URL/generate" \
+  -H 'Content-Type: application/json' \
+  -d '{"prompt":"Explain Kubernetes in one sentence.","max_new_tokens":32}'
+```
 
-### Results summary
+Alternatively, use `http://NODE_IP:30800` where network routing and firewall rules permit. No public hostname or HTTPS endpoint is provisioned by this repository.
 
-| Metric | Before | After | Change |
-|--------|--------|-------|--------|
-| Sustained throughput (req/s) | _TBD_ | _TBD_ | _TBD_ |
-| Output tokens/s | _TBD_ | _TBD_ | _TBD_ |
-| p50 latency `/generate` | _TBD_ | _TBD_ | _TBD_ |
-| p95 latency `/generate` | _TBD_ | _TBD_ | _TBD_ |
-| p95 TTFT | _TBD_ | _TBD_ | _TBD_ |
-| Error rate | _TBD_ | _TBD_ | _TBD_ |
-| Inference pod CPU utilization | _TBD_ | _TBD_ | _TBD_ |
-| Inference pod memory (peak) | _TBD_ | _TBD_ | _TBD_ |
+## API usage
 
----
+The FastAPI application exposes:
 
-## Security Considerations
+- `POST /generate`: simple text generation returning `{"text":"..."}`.
+- `GET /v1/models`: the configured served model name and context limit.
+- `POST /v1/chat/completions`: chat completions, optionally streamed using SSE.
+- `POST /v1/completions`: text completions, optionally streamed using SSE.
+- `GET /healthz`: a static `{"status":"ok"}` response.
 
-- No secrets in Git: credentials are provided via environment variables and CI secrets; `gitleaks` runs in CI.
-- Kubeconfig and SSH keys for reviewers are shared **out-of-band** (see [`docs/access.md`](docs/access.md)), using a dedicated read-only ServiceAccount and a time-limited SSH key.
-- SSH password authentication is disabled; firewall rules restrict the API server and NodePort ranges.
-- Container images run as non-root and are scanned with Trivy before deployment.
-- NetworkPolicies restrict traffic to the inference namespace to the ingress controller and Prometheus.
+There is no `/readyz` endpoint. `/healthz` does not run an inference or readiness check. Ray Serve separately calls the deployment's `check_health` method, which delegates to the engine's health check when available. Warmup runs lazily on the first generation request, so that request can take longer.
 
----
+### Simple generation
+
+```bash
+curl --fail-with-body "$API_URL/generate" \
+  -H 'Content-Type: application/json' \
+  -d '{"prompt":"What is an error budget?","max_new_tokens":64}'
+```
+
+`prompt` must contain 1–8000 characters by default. `max_new_tokens` defaults to 64 and accepts integers from 1 to 64. Input is formatted with the Qwen chat template before generation. The tokenized prompt, including template overhead, plus requested output must fit within the configured context limit (512 tokens in Kubernetes).
+
+Schema validation failures return HTTP 422. A prompt exceeding the context budget returns HTTP 400.
+
+### Chat completions and streaming
+
+```bash
+curl --fail-with-body "$API_URL/v1/chat/completions" \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "model":"Qwen/Qwen2.5-0.5B-Instruct",
+    "messages":[{"role":"user","content":"Give one tip for reducing MTTR."}],
+    "max_tokens":64
+  }'
+```
+
+For streaming, add `"stream":true` to the request and use `curl -N`. Streams end with `data: [DONE]`; `stream_options.include_usage` enables a final usage chunk.
+
+### Text completions
+
+```bash
+curl --fail-with-body "$API_URL/v1/completions" \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "model":"Qwen/Qwen2.5-0.5B-Instruct",
+    "prompt":"The three pillars of observability are",
+    "max_tokens":32
+  }'
+```
+
+Non-streamed text completions accept a string or a list of prompts. Streaming supports one prompt. Chat requests apply the chat template; text completions use the supplied prompt directly.
+
+### Compatibility boundaries
+
+The implementation supports common sampling fields, up to four output choices, and token usage reporting. Chat requests also accept `max_completion_tokens`. The output limit defaults to 64 tokens and can be changed for OpenAI-style routes with `OPENAI_MAX_TOKENS_LIMIT`.
+
+This is a subset of the OpenAI API: unsupported extra fields, including tool-related options, are accepted and ignored. Message content handling extracts text only. Do not infer tool execution or multimodal support from schema acceptance. OpenAI-style validation and context errors return HTTP 400 with an `error` object; an unknown model returns HTTP 404. Authentication and per-client rate limiting are not implemented.
+
+## Delivery workflow
+
+[deploy.yml](.github/workflows/deploy.yml) runs when a push to `main` changes files under `kubernetes/`. It checks out the repository, writes the **raw kubeconfig YAML** from the `KUBECONFIG_DATA` GitHub repository secret to the runner's kubeconfig, installs Helm, and applies `kubernetes/vllm-deployment.yaml` with kubectl.
+
+The workflow requires an already provisioned, reachable cluster with KubeRay and ServiceMonitor CRDs, the monitoring namespace, a populated model cache, and a published runtime image. Scope the kubeconfig permissions to the resources needed by this deployment.
+
+There are no committed CI lint/test jobs, image build or push steps, vulnerability scans, rollout checks, smoke tests, or automatic rollback. A change only under `endpoint/` does not trigger deployment. Publish a new image and update the manifest image reference to deliver application changes. A successful `kubectl apply` does not prove that the model is serving requests.
+
+## Monitoring
+
+The application manifest includes `ray-service-monitor` in namespace `monitoring`, labeled `release: prometheus`. It selects Services labeled `app: qwen-vllm` in namespace `default` and requests `/metrics` from the named `metrics` and `serve` ports every 15 seconds.
+
+Your Prometheus installation must select that ServiceMonitor and its namespace. The NodePort Service exposes the Ray metrics port at 8080. The FastAPI application does not define `/metrics` on its serving port; verify the port-8000 scrape target rather than assuming it provides engine metrics.
+
+Prometheus/Grafana installation, persistent storage, dashboards, alert rules, SLOs, and complete vLLM metric coverage are not supplied as code. Verify scrape targets and emitted metric names in the running environment before describing monitoring as operational.
+
+## Load testing
+
+The included harness sends concurrent `/generate` requests with a fixed prompt using Bash, curl, and xargs:
+
+```bash
+cd load-test
+cp env.example .env
+# Edit .env: set URL to your own /generate endpoint and configure the test parameters.
+bash load_test.sh
+cd ..
+```
+
+Run it from `load-test/`, because it reads `.env` from the current directory. Set `URL`, `PROMPT`, `MAX_TOKENS`, `CONCURRENCY`, and `TOTAL_REQUESTS`. Replace the sample public URL before running. Start with low concurrency; the manifest permits two ongoing Serve requests while the engine is configured for one sequence.
+
+The script prints response bodies, HTTP status codes, individual request durations, and total wall time. It does not calculate latency percentiles, output tokens per second, or enforce pass/fail thresholds. It interpolates the prompt into JSON without escaping, so use a simple prompt without embedded quotes or newlines. Concurrent script runs in the same directory share a temporary `payload.json` filename.
+
+There are no k6 scenarios, randomized prompt corpus, retained benchmark results, or measured before/after comparisons in the repository. Performance claims require recording the image, model revision, hardware, runtime settings, workload, errors, and resource usage alongside results.
+
+## Troubleshooting
+
+- **RayService resource type is unknown:** verify KubeRay installation and `rayservices.ray.io` CRD availability.
+- **ServiceMonitor apply fails:** check `servicemonitors.monitoring.coreos.com` and the `monitoring` namespace. Other resources in the same file may already have been created.
+- **Pod remains Pending:** inspect `kubectl -n default describe pod POD_NAME` for CPU, memory, or scheduling constraints.
+- **ImagePullBackOff:** check the manifest image reference, registry access, mirror availability, and pull credentials.
+- **Model cannot be found offline:** check `/opt/models/hub` on the node hosting the Ray head, cache symlink integrity, and permissions.
+- **Engine fails during startup:** inspect `kubectl -n default logs POD_NAME -c ray-head` for dependency, CPU extension, and memory errors. The Python module includes diagnostic probes for CPU extensions.
+- **Health succeeds but generation is slow or fails:** test `/generate` directly, allow for first-request warmup, and inspect logs. A static health response does not validate inference.
+- **Context-length error:** shorten the prompt or reduce requested output; chat-template tokens count toward the 512-token budget.
+- **GitHub deployment cannot connect:** verify the kubeconfig server address, certificate configuration, permissions, and runner network access.
+
+## Security and limitations
+
+The current files have several constraints to address before exposing the service broadly:
+
+- The golden-image configuration contains a fixed password and enables password SSH. Remove build credentials from the final image and rotate them wherever that image was used.
+- The example Ansible inventory disables SSH host-key checking. Configure trusted host keys for a maintained environment. Registry credentials are copied to node configuration, and their handling is not protected with `no_log` in the playbook.
+- Terraform enables public IPv4, uses existing security groups, and defines no private network. Firewall restrictions are an external responsibility.
+- NodePort exposes both serving and metrics ports. The API has no authentication, TLS, or rate limiting, and no NetworkPolicies are committed. Restrict access, including metrics and Ray management interfaces.
+- The runtime uses the `ray` user, but the Dockerfile grants world-write permissions on `/models`; the manifest does not define a hardened Pod security context.
+- Secret scanning, image scanning, dedicated reviewer RBAC, and an access handover document are not included. Share credentials outside Git and use limited permissions.
+- Terraform state, local configuration, inventories, and model caches must remain private. Existing ignore rules cover several of these, but do not cover every sensitive or generated file.
+- Dependencies, model revisions, and operator versions are not fully locked. Cache distribution, image publication, and cluster add-on installation remain manual.
 
 ## Teardown
 
+Remove application resources while the cluster is reachable:
+
 ```bash
-make destroy
-# equivalent to:
-# cd terraform/environments/prod && terraform destroy
+kubectl delete -f kubernetes/vllm-deployment.yaml
 ```
 
----
+This does not remove node-local model files or separately installed operators and monitoring tools. Uninstall shared components only if they are dedicated to this project.
 
-## AI Usage Disclosure
+To delete the VMs managed by this Terraform state, review and apply a destroy plan:
 
-AI-assisted tooling was used during this project. Details on which tools were used, for which tasks,
-and how their output was reviewed and validated are documented in [`ai-usage.md`](ai-usage.md).
+```bash
+terraform -chdir=terraform plan -destroy -out=destroy.tfplan
+terraform -chdir=terraform apply destroy.tfplan
+```
 
----
+VM deletion removes their local model caches. Protect and remove generated plan files after use; they are not excluded by the current ignore rules. Terraform does not delete the separately uploaded custom image, existing SSH key, or existing security group.
 
-## Author
+## AI usage and license
 
-**Mohammad Sajjad Asiyabani**
-Site Reliability Engineer
+AI assistance and the author's engineering workflow are described in [docs/ai-usage.md](docs/ai-usage.md).
 
-- GitHub: [@sunba91-su](https://github.com/sunba91-su)
+Author: **Mohammad Sajjad Asiyabani**. Prepared for the **ArvanCloud SRE Technical Challenge**.
 
-Prepared as part of the **ArvanCloud SRE Technical Challenge**.
-
----
-
-## License
-
-Distributed under the Apache License 2.0. See [LICENSE](LICENSE) for details.
+Distributed under the [Apache License 2.0](LICENSE).

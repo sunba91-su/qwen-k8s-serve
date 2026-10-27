@@ -1,0 +1,145 @@
+---
+apiVersion: ray.io/v1
+kind: RayService
+metadata:
+  name: qwen-vllm-service
+  namespace: default
+  labels:
+    app: qwen-vllm
+spec:
+  serveConfigV2: |
+    http_options:
+      host: 0.0.0.0
+      port: 8000
+    applications:
+      - name: qwen-app
+        import_path: serve_script:deployment
+        route_prefix: /
+        deployments:
+          - name: qwen-vllm
+            num_replicas: 1
+            max_ongoing_requests: 2
+            ray_actor_options:
+              num_cpus: 2
+            health_check_timeout_s: 1800
+            graceful_shutdown_timeout_s: 60
+  rayClusterConfig:
+    rayVersion: "2.40.0"
+    headGroupSpec:
+      rayStartParams:
+        dashboard-host: "0.0.0.0"
+        num-cpus: "2"
+      template:
+        metadata:
+          labels:
+            app: qwen-vllm
+            ray.io/node-type: head
+        spec:
+          containers:
+            - name: ray-head
+              image: asiyabani/qwen-vllm-serve:v2
+              imagePullPolicy: IfNotPresent
+              ports:
+                - containerPort: 8000
+                  name: serve
+                - containerPort: 8265
+                  name: dashboard
+                - containerPort: 8080
+                  name: metrics
+              env:
+                - name: MODEL_ID
+                  value: "Qwen/Qwen2.5-0.5B-Instruct"
+                - name: HF_HOME
+                  value: "/models"
+                - name: HF_HUB_CACHE
+                  value: "/models"
+                - name: SWAP_SPACE
+                  value: "0"
+                - name: swap_space
+                  value: "0"
+                - name: TRANSFORMERS_OFFLINE
+                  value: "1"
+                - name: HF_HUB_OFFLINE
+                  value: "1"
+                - name: HF_DATASETS_OFFLINE
+                  value: "1"
+                - name: PYTHONPATH
+                  value: /home/ray/app
+                - name: OMP_NUM_THREADS
+                  value: "1"
+                - name: VLLM_CPU_OMP_THREADS_BIND
+                  value: nobind
+                - name: VLLM_CPU_KVCACHE_SPACE
+                  value: "1"
+                - name: KV_CACHE_GIB
+                  value: "1"
+                - name: MAX_MODEL_LEN
+                  value: "512"
+                - name: MAX_NUM_SEQS
+                  value: "1"
+                - name: REPLICA_NUM_CPUS
+                  value: "1"
+                - name: TORCHDYNAMO_DISABLE
+                  value: "1"
+                - name: RAY_SERVE_HTTP_REQUEST_MAX_RETRIES
+                  value: "10"
+                - name: RAY_SERVE_KV_TIMEOUT_S
+                  value: "300"
+              resources:
+                requests:
+                  cpu: "2"
+                  memory: 6Gi
+                limits:
+                  cpu: "2"
+                  memory: 6Gi
+              volumeMounts:
+                - mountPath: /models
+                  name: model-cache
+          volumes:
+            - name: model-cache
+              hostPath:
+                path: /opt/models/hub
+                type: DirectoryOrCreate
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: qwen-vllm-serve
+  namespace: default
+  labels:
+    app: qwen-vllm
+spec:
+  type: NodePort
+  selector:
+    app: qwen-vllm
+    ray.io/node-type: head
+  ports:
+    - name: serve
+      port: 8000
+      targetPort: serve
+      nodePort: 30800
+    - name: metrics
+      port: 8080
+      targetPort: metrics
+---
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: ray-service-monitor
+  namespace: monitoring
+  labels:
+    release: prometheus
+spec:
+  selector:
+    matchLabels:
+      app: qwen-vllm
+  namespaceSelector:
+    matchNames:
+      - default
+  endpoints:
+    - port: metrics
+      path: /metrics
+      interval: 15s
+    - port: serve
+      path: /metrics
+      interval: 15s

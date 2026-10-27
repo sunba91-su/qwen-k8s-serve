@@ -1,0 +1,142 @@
+---
+- name: Install Kubernetes Packages and Configure OS on all nodes
+  hosts: all
+  become: yes
+  tasks:
+    - name: Load overlay kernel module
+      modprobe:
+        name: overlay
+        state: present
+
+    - name: Load br_netfilter kernel module
+      modprobe:
+        name: br_netfilter
+        state: present
+
+    - name: Set sysctl parameters for Kubernetes networking
+      sysctl:
+        name: "{{ item }}"
+        value: '1'
+        state: present
+        reload: yes
+      loop:
+        - net.bridge.bridge-nf-call-iptables
+        - net.bridge.bridge-nf-call-ip6tables
+        - net.ipv4.ip_forward
+
+    - name: Ensure apt keyring directory exists
+      file:
+        path: /etc/apt/keyrings
+        state: directory
+        mode: '0755'
+
+    - name: Add Kubernetes apt key
+      shell: curl -fsSL https://pkgs.k8s.io/core:/stable:/v1.28/deb/Release.key | gpg --dearmor -o /etc/apt/keyrings/kubernetes-apt-keyring.gpg
+      args:
+        creates: /etc/apt/keyrings/kubernetes-apt-keyring.gpg
+
+    - name: Add Kubernetes apt repository
+      copy:
+        dest: /etc/apt/sources.list.d/kubernetes.list
+        content: "deb [signed-by=/etc/apt/keyrings/kubernetes-apt-keyring.gpg] https://pkgs.k8s.io/core:/stable:/v1.28/deb/ /"
+
+    - name: Install kubelet, kubeadm, kubectl
+      apt:
+        name: 
+          - kubelet
+          - kubeadm
+          - kubectl
+        state: present
+        update_cache: yes
+
+    - name: Hold kubernetes packages at current version
+      dpkg_selections:
+        name: "{{ item }}"
+        selection: hold
+      loop:
+        - kubelet
+        - kubeadm
+        - kubectl
+
+    - name: Enable certs.d config_path in containerd
+      shell: sed -i 's|config_path = .*|config_path = "/etc/containerd/certs.d"|g' /etc/containerd/config.toml
+      become: yes
+
+    - name: Create certs.d registry directory
+      file:
+        path: "/etc/containerd/certs.d/{{ registry_host }}"
+        state: directory
+        mode: '0755'
+      become: yes
+
+    - name: Configure hosts.toml for registry auth
+      copy:
+        dest: "/etc/containerd/certs.d/{{ registry_host }}/hosts.toml"
+        content: |
+          server = "https://{{ registry_host }}"
+          
+          [host."https://{{ registry_host }}"]
+            capabilities = ["pull", "resolve"]
+            [host."https://{{ registry_host }}".auth]
+              username = "{{ registry_username }}"
+              password = "{{ registry_password }}"
+      become: yes
+
+    - name: Restart containerd to apply certs.d auth
+      systemd:
+        name: containerd
+        state: restarted
+      become: yes
+
+    # - name: Pre-pull Kubernetes images using ctr to bypass CRI auth issues
+    #   shell: |
+    #     for image in $(kubeadm config images list --image-repository={{ registry_host }}); do
+    #       ctr -n k8s.io images pull -u "{{ registry_username }}:{{ registry_password }}" $image
+    #     done
+    #   become: yes
+- name: Initialize Kubernetes Master
+  hosts: master
+  become: yes
+  tasks:
+    - name: Initialize the cluster with kubeadm
+      command: kubeadm init --pod-network-cidr=192.168.0.0/16 --image-repository=registry.aliyuncs.com/google_containers --ignore-preflight-errors=ImagePull
+      args:
+        creates: /etc/kubernetes/admin.conf
+
+    - name: Setup kubeconfig for ubuntu user
+      file:
+        path: /home/ubuntu/.kube
+        state: directory
+        owner: ubuntu
+        group: ubuntu
+        mode: '0755'
+
+    - name: Copy admin.conf to user kubeconfig
+      copy:
+        src: /etc/kubernetes/admin.conf
+        dest: /home/ubuntu/.kube/config
+        remote_src: yes
+        owner: ubuntu
+        group: ubuntu
+        mode: '0644'
+
+    - name: Install Calico Network Plugin
+      become: no
+      command: kubectl apply -f https://raw.githubusercontent.com/projectcalico/calico/v3.26.1/manifests/calico.yaml
+
+    - name: Generate join command
+      command: kubeadm token create --print-join-command
+      register: join_command_raw
+
+    - name: Set join command as a fact
+      set_fact:
+        join_command: "{{ join_command_raw.stdout }}"
+
+- name: Join Worker Nodes
+  hosts: workers
+  become: yes
+  tasks:
+    - name: Join the worker nodes to cluster
+      command: "{{ hostvars[groups['master'][0]]['join_command'] }}"
+      args:
+        creates: /etc/kubernetes/kubelet.conf

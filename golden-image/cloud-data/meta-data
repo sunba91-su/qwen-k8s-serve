@@ -1,0 +1,2 @@
+instance-id: packer-image-build
+local-hostname: ubuntu

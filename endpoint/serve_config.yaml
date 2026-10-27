@@ -1,0 +1,10 @@
+# Ray 2.10 dropped --host/--port from `serve run`. An import path binds to
+# 127.0.0.1; this config binds the proxy on every interface so Docker can publish it.
+http_options:
+  host: 0.0.0.0
+  port: 8000
+
+applications:
+  - name: qwen-app
+    import_path: serve_script:deployment
+    route_prefix: /
