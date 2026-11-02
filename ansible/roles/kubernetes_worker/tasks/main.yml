@@ -1,0 +1,24 @@
+---
+- name: Check existing worker membership
+  ansible.builtin.stat:
+    path: /etc/kubernetes/kubelet.conf
+  register: kubernetes_worker_membership
+
+- name: Join only unconfigured workers
+  when:
+    - not kubernetes_worker_membership.stat.exists
+    - not ansible_check_mode
+  block:
+    - name: Create short-lived join credentials on control plane
+      ansible.builtin.command:
+        argv: [kubeadm, token, create, '--ttl={{ kubernetes_worker_join_token_ttl }}', --print-join-command]
+      delegate_to: "{{ groups['master'][0] }}"
+      register: kubernetes_worker_join
+      changed_when: true
+      no_log: true
+
+    - name: Join worker once
+      ansible.builtin.command:
+        argv: "{{ kubernetes_worker_join.stdout.split() + kubernetes_worker_extra_join_args }}"
+        creates: /etc/kubernetes/kubelet.conf
+      no_log: true

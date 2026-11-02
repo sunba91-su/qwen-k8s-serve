@@ -1,14 +1,27 @@
 [master]
-1.1.1.1 
+control-plane ansible_host=1.1.1.1
 
 [workers]
-2.2.2.2
-3.3.3.3
+worker-1 ansible_host=2.2.2.2
+worker-2 ansible_host=3.3.3.3
 
 [all:vars]
 ansible_user=ubuntu
 ansible_ssh_private_key_file=/PATH/TO/SSH/KEY
-ansible_ssh_common_args='-o StrictHostKeyChecking=no'
-registry_username=REGISTRY_USERNAME
-registry_password=REGISTRY_PASSWORD
-registry_host="mirror.asiyabani.id.ir"
+kubernetes_node_minor_version=v1.28
+# Optional exact Debian package version; existing held packages are never upgraded automatically.
+# kubernetes_node_package_version=1.28.15-1.1
+kubernetes_node_disable_swap=true
+registry_host=mirror.asiyabani.id.ir
+# Store credentials in inventory-adjacent group_vars/all/vault.yml using ansible-vault.
+# registry_username=REGISTRY_USERNAME
+# registry_password=REGISTRY_PASSWORD
+
+[master:vars]
+kubernetes_control_plane_user=ubuntu
+kubernetes_control_plane_pod_cidr=192.168.0.0/16
+kubernetes_control_plane_image_repository=registry.aliyuncs.com/google_containers
+kubernetes_control_plane_calico_version=v3.26.1
+
+[workers:vars]
+kubernetes_worker_join_token_ttl=15m

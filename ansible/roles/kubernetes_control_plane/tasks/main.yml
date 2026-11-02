@@ -1,0 +1,62 @@
+---
+- name: Initialize control plane once
+  ansible.builtin.command:
+    argv: "{{ ['kubeadm', 'init', '--pod-network-cidr=' ~ kubernetes_control_plane_pod_cidr, '--image-repository=' ~ kubernetes_control_plane_image_repository] + (['--ignore-preflight-errors=' ~ (kubernetes_control_plane_ignore_preflight_errors | join(','))] if kubernetes_control_plane_ignore_preflight_errors | length else []) + kubernetes_control_plane_extra_init_args }}"
+    creates: /etc/kubernetes/admin.conf
+
+- name: Discover kubeconfig user home and primary group
+  ansible.builtin.getent:
+    database: passwd
+    key: "{{ kubernetes_control_plane_user }}"
+
+- name: Create private kubeconfig directory
+  ansible.builtin.file:
+    path: "{{ ansible_facts.getent_passwd[kubernetes_control_plane_user][4] }}/.kube"
+    state: directory
+    owner: "{{ kubernetes_control_plane_user }}"
+    group: "{{ ansible_facts.getent_passwd[kubernetes_control_plane_user][2] }}"
+    mode: '0700'
+
+- name: Install administrator kubeconfig
+  ansible.builtin.copy:
+    src: /etc/kubernetes/admin.conf
+    dest: "{{ ansible_facts.getent_passwd[kubernetes_control_plane_user][4] }}/.kube/config"
+    remote_src: true
+    owner: "{{ kubernetes_control_plane_user }}"
+    group: "{{ ansible_facts.getent_passwd[kubernetes_control_plane_user][2] }}"
+    mode: '0600'
+  when: not ansible_check_mode
+
+- name: Manage Calico networking
+  when: kubernetes_control_plane_calico_enabled | bool
+  block:
+    - name: Download versioned Calico manifest
+      ansible.builtin.get_url:
+        url: "{{ kubernetes_control_plane_calico_url }}"
+        dest: "/etc/kubernetes/calico-{{ kubernetes_control_plane_calico_version }}-upstream.yaml"
+        checksum: "{{ kubernetes_control_plane_calico_checksum | default(omit, true) }}"
+        mode: '0644'
+      when: not ansible_check_mode
+
+    - name: Read upstream Calico manifest
+      ansible.builtin.slurp:
+        src: "/etc/kubernetes/calico-{{ kubernetes_control_plane_calico_version }}-upstream.yaml"
+      register: kubernetes_control_plane_calico_source
+      when: not ansible_check_mode
+
+    - name: Render Calico pod network configuration
+      ansible.builtin.copy:
+        dest: /etc/kubernetes/calico.yaml
+        content: >-
+          {{ kubernetes_control_plane_calico_source.content | b64decode |
+             regex_replace('(?m)^(\s*)# - name: CALICO_IPV4POOL_CIDR\n\s*#   value: "[^"\n]+"',
+             '\1- name: CALICO_IPV4POOL_CIDR\n\1  value: "' ~ kubernetes_control_plane_pod_cidr ~ '"') }}
+        mode: '0644'
+      when: not ansible_check_mode
+
+    - name: Reconcile Calico resources
+      ansible.builtin.command:
+        argv: [kubectl, --kubeconfig=/etc/kubernetes/admin.conf, apply, -f, /etc/kubernetes/calico.yaml]
+      register: kubernetes_control_plane_calico_apply
+      changed_when: "' created' in kubernetes_control_plane_calico_apply.stdout or ' configured' in kubernetes_control_plane_calico_apply.stdout"
+      when: not ansible_check_mode

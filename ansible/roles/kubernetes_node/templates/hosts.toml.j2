@@ -1,0 +1,8 @@
+# {{ ansible_managed }}
+server = "https://{{ kubernetes_node_registry_host }}"
+[host."https://{{ kubernetes_node_registry_host }}"]
+  capabilities = ["pull", "resolve"]
+{% if kubernetes_node_registry_username | length > 0 %}
+  [host."https://{{ kubernetes_node_registry_host }}".header]
+    authorization = ["Basic {{ (kubernetes_node_registry_username ~ ':' ~ kubernetes_node_registry_password) | b64encode }}"]
+{% endif %}

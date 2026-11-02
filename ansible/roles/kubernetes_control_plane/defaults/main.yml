@@ -1,0 +1,10 @@
+---
+kubernetes_control_plane_pod_cidr: 192.168.0.0/16
+kubernetes_control_plane_image_repository: registry.aliyuncs.com/google_containers
+kubernetes_control_plane_user: "{{ ansible_user | default('ubuntu') }}"
+kubernetes_control_plane_ignore_preflight_errors: []
+kubernetes_control_plane_extra_init_args: []
+kubernetes_control_plane_calico_enabled: true
+kubernetes_control_plane_calico_version: v3.26.1
+kubernetes_control_plane_calico_url: "https://raw.githubusercontent.com/projectcalico/calico/{{ kubernetes_control_plane_calico_version }}/manifests/calico.yaml"
+kubernetes_control_plane_calico_checksum: ""

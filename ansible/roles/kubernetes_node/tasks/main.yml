@@ -1,0 +1,136 @@
+---
+- name: Validate supported topology and OS
+  ansible.builtin.assert:
+    that:
+      - ansible_facts.os_family == 'Debian'
+      - groups.get('master', []) | length == 1
+      - (groups.get('master', []) | intersect(groups.get('workers', []))) | length == 0
+      - kubernetes_node_minor_version is match('^v[0-9]+\.[0-9]+$')
+      - kubernetes_node_registry_host is match('^[A-Za-z0-9.:-]*$')
+      - (kubernetes_node_registry_username | length == 0) == (kubernetes_node_registry_password | length == 0)
+    fail_msg: Requires Debian/Ubuntu, exactly one master, distinct workers, and valid registry settings.
+  no_log: true
+
+- name: Install repository prerequisites
+  ansible.builtin.apt:
+    name: [ca-certificates, gpg]
+    state: present
+    update_cache: true
+    cache_valid_time: "{{ kubernetes_node_apt_cache_valid_time }}"
+
+- name: Persist required modules
+  ansible.builtin.copy:
+    dest: /etc/modules-load.d/kubernetes.conf
+    content: "{{ kubernetes_node_modules | join('\n') }}\n"
+    mode: '0644'
+
+- name: Load required modules
+  community.general.modprobe:
+    name: "{{ item }}"
+    state: present
+  loop: "{{ kubernetes_node_modules }}"
+
+- name: Configure Kubernetes networking
+  ansible.posix.sysctl:
+    name: "{{ item.key }}"
+    value: "{{ item.value }}"
+    sysctl_file: /etc/sysctl.d/99-kubernetes.conf
+    sysctl_set: true
+    reload: true
+  loop: "{{ kubernetes_node_sysctls | dict2items }}"
+
+- name: Disable active swap
+  ansible.builtin.command: swapoff -a
+  when:
+    - kubernetes_node_disable_swap | bool
+    - ansible_facts.swaptotal_mb | int > 0
+  changed_when: true
+
+- name: Disable swap on subsequent boots
+  ansible.builtin.replace:
+    path: /etc/fstab
+    regexp: '^(?!#)(\S+\s+\S+\s+swap\s+.*)$'
+    replace: '# Ansible disabled swap: \1'
+  when: kubernetes_node_disable_swap | bool
+
+- name: Create apt keyring directory
+  ansible.builtin.file:
+    path: /etc/apt/keyrings
+    state: directory
+    mode: '0755'
+
+- name: Download Kubernetes signing key
+  ansible.builtin.get_url:
+    url: "{{ kubernetes_node_repository_url }}Release.key"
+    dest: /etc/apt/keyrings/kubernetes.asc
+    mode: '0644'
+
+- name: Configure Kubernetes package repository
+  ansible.builtin.apt_repository:
+    repo: "deb [signed-by=/etc/apt/keyrings/kubernetes.asc] {{ kubernetes_node_repository_url }} /"
+    filename: kubernetes
+    state: present
+    update_cache: true
+
+- name: Install Kubernetes packages without upgrading held packages
+  ansible.builtin.apt:
+    name: "{{ item }}{{ ('=' ~ kubernetes_node_package_version) if kubernetes_node_package_version | length else '' }}"
+    state: present
+  loop: "{{ kubernetes_node_packages }}"
+
+- name: Hold Kubernetes packages
+  ansible.builtin.dpkg_selections:
+    name: "{{ item }}"
+    selection: hold
+  loop: "{{ kubernetes_node_packages }}"
+
+- name: Read existing containerd configuration
+  ansible.builtin.slurp:
+    src: /etc/containerd/config.toml
+  register: kubernetes_node_containerd_config
+
+- name: Require supported containerd CRI registry configuration
+  ansible.builtin.assert:
+    that:
+      - >-
+        (kubernetes_node_containerd_config.content | b64decode) is search('(?m)^[ \t]*\[plugins\."io\.containerd\.grpc\.v1\.cri"\.registry\]\s*\n(?:[ \t]+[^\n]*\n)*?[ \t]*config_path[ \t]*=')
+    fail_msg: Requires an existing containerd 1.x config with a CRI registry config_path. Migrate containerd 2.x separately.
+
+- name: Configure containerd registry directory within the CRI registry section
+  ansible.builtin.replace:
+    path: /etc/containerd/config.toml
+    regexp: '(?m)(^[ \t]*\[plugins\."io\.containerd\.grpc\.v1\.cri"\.registry\]\s*\n(?:[ \t]+[^\n]*\n)*?[ \t]*config_path[ \t]*=)[^\n]*'
+    replace: '\1 "/etc/containerd/certs.d"'
+    backup: true
+  notify: Restart containerd
+
+- name: Create registry host directory
+  ansible.builtin.file:
+    path: "/etc/containerd/certs.d/{{ kubernetes_node_registry_host }}"
+    state: directory
+    mode: '0700'
+  when: kubernetes_node_registry_host | length > 0
+
+- name: Configure registry endpoint and authentication
+  ansible.builtin.template:
+    src: hosts.toml.j2
+    dest: "/etc/containerd/certs.d/{{ kubernetes_node_registry_host }}/hosts.toml"
+    mode: '0600'
+  when: kubernetes_node_registry_host | length > 0
+  no_log: true
+  diff: false
+  notify: Restart containerd
+
+- name: Apply container runtime changes before bootstrap
+  ansible.builtin.meta: flush_handlers
+
+- name: Ensure container runtime is running
+  ansible.builtin.systemd_service:
+    name: containerd
+    enabled: true
+    state: started
+
+- name: Enable kubelet for kubeadm
+  ansible.builtin.systemd_service:
+    name: kubelet
+    enabled: true

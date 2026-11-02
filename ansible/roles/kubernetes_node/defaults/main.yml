@@ -1,0 +1,16 @@
+---
+kubernetes_node_minor_version: v1.28
+# Empty means install the repository candidate, then hold it. No automatic upgrades.
+kubernetes_node_package_version: ""
+kubernetes_node_packages: [kubelet, kubeadm, kubectl]
+kubernetes_node_apt_cache_valid_time: 3600
+kubernetes_node_disable_swap: true
+kubernetes_node_modules: [overlay, br_netfilter]
+kubernetes_node_sysctls:
+  net.bridge.bridge-nf-call-iptables: '1'
+  net.bridge.bridge-nf-call-ip6tables: '1'
+  net.ipv4.ip_forward: '1'
+kubernetes_node_repository_url: "https://pkgs.k8s.io/core:/stable:/{{ kubernetes_node_minor_version }}/deb/"
+kubernetes_node_registry_host: "{{ registry_host | default('') }}"
+kubernetes_node_registry_username: "{{ registry_username | default('') }}"
+kubernetes_node_registry_password: "{{ registry_password | default('') }}"

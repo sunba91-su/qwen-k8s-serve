@@ -140,9 +140,10 @@ State is local: no remote backend is configured. Protect the state and plan file
 cp ansible/inventory.ini.example ansible/inventory.ini
 ```
 
-Replace the example addresses, SSH key path, and registry credentials. The playbook assumes an `ubuntu` user and an existing containerd installation from the golden image. Check that swap is disabled on the target nodes; the playbook does not disable it.
+Replace the example addresses, SSH key path, and registry settings. The role-based playbook requires an existing containerd 1.x configuration from the golden image and disables swap by default. Configure users, versions, and networking through inventory; see [the Ansible guide](ansible/README.md) for requirements, Vault, check mode, idempotency verification, and recovery.
 
 ```bash
+ansible-galaxy collection install -r ansible/requirements.yml
 ansible all -i ansible/inventory.ini -m ping
 ansible-playbook -i ansible/inventory.ini ansible/k8s-setup.yml
 ```
